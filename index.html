@@ -2729,6 +2729,7 @@ function renderEmployees(){
  </div>
  <div class="toolrow">
   <button class="btn sm" onclick="addEmpUI()">+ Добавить сотрудника</button>
+  <button class="btn sm" onclick="go('team')">📊 Аналитика</button>
   <button class="btn sm sec" onclick="copyText(makeJoinLink([]))">🔗 Ссылка саморегистрации</button>
   <button class="btn sm sec" onclick="copyText(makeJoinLink(['vovl','enps']))">🔗 Ссылка: вовлечённость + eNPS</button>
   <button class="btn sm sec" onclick="seedDemo(true)">Демо-данные</button>
@@ -3223,6 +3224,7 @@ function go(screen,arg,arg2){
  else if(screen==="form")renderForm(arg,arg2);
  else if(screen==="result")renderRecord(arg);
  else if(screen==="employees")renderEmployees();
+ else if(screen==="team")renderTeamAnalytics();
  else if(screen==="emp")renderEmpCard(arg);
  else if(screen==="cabinet")renderCabinet(arg);
  else if(screen==="hiring")renderHiring();
@@ -3349,6 +3351,567 @@ function init(){
  }).catch(e=>renderLogin(String(e.message||e)));
 }
 init();
+// ============================================================ АНАЛИТИКА КОМАНДЫ
+// Реализация «Методологии командного анализа». Пороги и веса — в TEAM_CFG.
+// Расчётные функции чистые (teamStats/teamIndexes/teamCross/teamPerTest работают
+// с массивом members[]); teamData() лишь собирает members из хранилища.
+
+const TEAM_CFG={
+ minTeam:3,               // < этого — «мало данных»
+ cov:{min:0.6, minN:3},   // покрытие теста: доля и абсолют
+ balcony:{medUpper:true, share:0.60}, // балкон: медиана в верхней зоне и ≥60% сверху
+ basement:{medLower:true, share:0.50},// подвал: медиана в нижней зоне и ≥50% снизу
+ polar:{upper:0.35, lower:0.35, mid:0.30},
+ anomaly:{minN:5, k:1.8},
+ zones:{ // границы «верх/низ» в ИСХОДНЫХ единицах шкалы
+  rez:{up:4.0, lo:3.0},            // балл 1–5
+  grani:{up:32, lo:-32},           // std −100..100
+  logika:{up:110, lo:95},          // IQ
+  sale:{up:61, lo:40},             // 0–100
+  vovl:{up:7, lo:4},               // 0–10 (шкалы)
+  vovlIndex:{up:8, lo:4},          // индекс 0–10 (категории)
+  paei:{up:65, lo:35},             // 0–100
+  arch:{up:21, lo:12},             // сумма 6–30
+  enps:{up:9, lo:6}                // личная оценка 0–10 (промоутер≥9, критик≤6)
+ },
+ carrier:{paei:65, paeiMid:50, arch:21, archMid:18, grani:32, heroDriver:21},
+ idxColors:{green:70, yellow:40}, // ≥70 зелёный, 40–69 жёлтый, <40 красный
+ riskRed:40,
+ rules:{
+  winnerStrong:0.25, winnerWeak:0.10, winnerFlood:0.60, waiterBallast:0.15,
+  granPdv:0.30, granUnrel:0.20,
+  iqGap:30,
+  saleResultFlag:0.40, saleResultShare:0.30, hunterLo:0.40, hunterHi:0.60, farmerMin:0.60,
+  vovlSdSplit:2, vovlSincerity:75, vovlBurnCluster:2,
+  paeiMono:0.60, archMono:0.60
+ }
+};
+
+// ---------- маленькие утилиты статистики ----------
+function _num(list){ // list: [{id,name,v}] -> только валидные числа
+ return list.filter(x=>x&&x.v!=null&&!isNaN(x.v));
+}
+function nstat(list){
+ const good=_num(list); const vals=good.map(x=>x.v);
+ const n=vals.length;
+ if(!n)return {n:0,med:null,m:null,sd:0,min:null,max:null,cv:0,list:[]};
+ const s=[...vals].sort((a,b)=>a-b);
+ const med=n%2? s[(n-1)/2] : (s[n/2-1]+s[n/2])/2;
+ const m=vals.reduce((a,b)=>a+b,0)/n;
+ const sd=Math.sqrt(vals.reduce((a,b)=>a+(b-m)*(b-m),0)/n);
+ return {n,med,m,sd,min:s[0],max:s[n-1],cv:m!==0?sd/Math.abs(m):0,list:good};
+}
+function shareIn(list,pred){const g=_num(list);if(!g.length)return 0;return g.filter(x=>pred(x.v)).length/g.length;}
+function membersIn(list,pred){return _num(list).filter(x=>pred(x.v));}
+function round(v,d){const p=Math.pow(10,d||0);return Math.round(v*p)/p;}
+
+// ---------- нормировка к 0–100 ----------
+const TEAM_NORM={
+ rez:v=>(v-1)/4*100,
+ grani:v=>(v+100)/2,
+ logika:v=>(v-60)/80*100,
+ sale:v=>v,
+ vovl:v=>v*10,
+ paei:v=>v,
+ arch:v=>(v-6)/24*100,
+ enps:v=>v*10
+};
+
+// ---------- сбор данных команды ----------
+function teamData(includeOnboarding){
+ const src=employees().filter(e=>e.stage==="staff"||(includeOnboarding&&e.stage==="onboarding"));
+ return src.map(e=>{
+  const rez=lastRec(e.id,"rez"), gr=lastRec(e.id,"grani"), lo=lastRec(e.id,"logika"),
+   sa=lastRec(e.id,"sale"), vo=lastRec(e.id,"vovl"), pa=lastRec(e.id,"paei"),
+   ar=lastRec(e.id,"arch"), en=lastRec(e.id,"enps");
+  let rezM=null;
+  if(rez){const sc=Object.values(rez.hr.scores||{}).map(Number).filter(v=>!isNaN(v));
+   rezM={avg:sc.length?sc.reduce((a,b)=>a+b,0)/sc.length:null,type:rezTypology(rez.answers)};}
+  return {id:e.id,name:e.name,pos:e.pos||"",stage:e.stage,
+   rez:rezM, grani:gr?gr.result:null, logika:lo?lo.result:null, sale:sa?sa.result:null,
+   vovl:vo?vo.result:null, paei:pa?pa.result:null, arch:ar?ar.result:null,
+   enps:en?en.result:null, matrix:e.matrix||null};
+ });
+}
+
+// ---------- покрытие + статистики по шкалам ----------
+function teamStats(members){
+ const N=members.length;
+ const has={
+  rez:m=>m.rez&&m.rez.avg!=null, grani:m=>!!m.grani, logika:m=>!!m.logika,
+  sale:m=>!!m.sale, vovl:m=>!!m.vovl, paei:m=>!!m.paei, arch:m=>!!m.arch, enps:m=>!!m.enps
+ };
+ const present={},cov={},valid={};
+ Object.keys(has).forEach(t=>{const c=members.filter(has[t]).length;present[t]=c;cov[t]=N?c/N:0;valid[t]=cov[t]>=TEAM_CFG.cov.min&&c>=TEAM_CFG.cov.minN;});
+
+ const col=(pred,get)=>members.filter(pred).map(m=>({id:m.id,name:m.name,v:get(m)}));
+ const S={N,present,cov,valid,scales:{}};
+
+ if(present.rez) S.scales.rez={avg:nstat(col(has.rez,m=>m.rez.avg))};
+ if(present.grani){
+  S.scales.grani={perScale:[],mean:null};
+  for(let i=0;i<10;i++)S.scales.grani.perScale.push(nstat(col(has.grani,m=>m.grani.std[i])));
+  S.scales.grani.mean=nstat(col(has.grani,m=>m.grani.std.reduce((a,b)=>a+b,0)/10));
+ }
+ if(present.logika){
+  S.scales.logika={iq:nstat(col(has.logika,m=>m.logika.iq)),sections:[]};
+  for(let i=0;i<4;i++)S.scales.logika.sections.push(nstat(col(has.logika,m=>m.logika.sections[i])));
+ }
+ if(present.sale){S.scales.sale={perScale:[]};for(let i=0;i<12;i++)S.scales.sale.perScale.push(nstat(col(has.sale,m=>m.sale.sc[i])));}
+ if(present.vovl){
+  S.scales.vovl={perScale:[],index:nstat(col(has.vovl,m=>m.vovl.index)),battery:nstat(col(has.vovl,m=>m.vovl.battery))};
+  for(let i=0;i<12;i++)S.scales.vovl.perScale.push(nstat(col(has.vovl,m=>m.vovl.sc[i])));
+ }
+ if(present.paei){S.scales.paei={perScale:[]};for(let i=0;i<4;i++)S.scales.paei.perScale.push(nstat(col(has.paei,m=>m.paei.sc[i])));}
+ if(present.arch){
+  S.scales.arch={perScale:[],groups:[]};
+  for(let i=0;i<12;i++)S.scales.arch.perScale.push(nstat(col(has.arch,m=>m.arch.sums[i])));
+  for(let g=0;g<4;g++)S.scales.arch.groups.push(nstat(col(has.arch,m=>m.arch.groups[g])));
+ }
+ if(present.enps){
+  const list=col(has.enps,m=>m.enps.score);
+  const g=_num(list); const p=g.filter(x=>x.v>=9).length,d=g.filter(x=>x.v<=6).length;
+  S.scales.enps={score:nstat(list),val:g.length?Math.round((p-d)/g.length*100):0,p,d,pas:g.length-p-d,n:g.length};
+ }
+ return S;
+}
+
+// ---------- индексы ----------
+function idxColor(v){return v>=TEAM_CFG.idxColors.green?"#16a34a":v>=TEAM_CFG.idxColors.yellow?"#f59e0b":"#dc2626";}
+
+function paeiCoverage(members){ // 0–50
+ let sum=0;const roles=["P","A","E","I"];
+ const detail=roles.map((r,ri)=>{
+  const vals=members.filter(m=>m.paei).map(m=>m.paei.sc[ri]);
+  const mx=vals.length?Math.max(...vals):0;
+  const pts=mx>=TEAM_CFG.carrier.paei?12.5:mx>=TEAM_CFG.carrier.paeiMid?6:0;
+  sum+=pts;return {role:r,max:mx,pts};
+ });
+ return {score:sum,detail};
+}
+// ведущий архетип каждой группы (для «носителя мотивации»)
+const ARCH_GROUP_IDX=[[0,1,2],[3,4,5],[6,7,8],[9,10,11]];
+function motivCoverage(members){ // 0–50
+ let sum=0;
+ const detail=ARCH_GROUP_IDX.map((idxs,g)=>{
+  let mx=0;members.forEach(m=>{if(m.arch){const local=Math.max(...idxs.map(i=>m.arch.sums[i]));if(local>mx)mx=local;}});
+  const pts=mx>=TEAM_CFG.carrier.arch?12.5:mx>=TEAM_CFG.carrier.archMid?6:0;
+  sum+=pts;return {group:g,max:mx,pts};
+ });
+ return {score:sum,detail};
+}
+
+function teamIndexes(members,S){
+ const N=members.length;
+ // 2.1 Сила
+ const comp=[];
+ if(S.valid.rez&&S.scales.rez.avg.n) comp.push({w:0.20,n:TEAM_NORM.rez(S.scales.rez.avg.med)});
+ if(S.valid.grani&&S.scales.grani.mean.n){const meds=S.scales.grani.perScale.map(s=>s.med).filter(v=>v!=null);
+  comp.push({w:0.20,n:meds.reduce((a,b)=>a+TEAM_NORM.grani(b),0)/meds.length});}
+ if(S.valid.logika&&S.scales.logika.iq.n) comp.push({w:0.10,n:TEAM_NORM.logika(S.scales.logika.iq.med)});
+ if(S.valid.vovl&&S.scales.vovl.index.n) comp.push({w:0.20,n:TEAM_NORM.vovl(S.scales.vovl.index.med)});
+ const bal=teamBalanceRaw(members,S);
+ if(S.valid.paei) comp.push({w:0.15,n:bal.paei.score*2});
+ if(S.valid.arch) comp.push({w:0.05,n:bal.motiv.score*2});
+ if(S.valid.enps&&S.scales.enps.n) comp.push({w:0.10,n:(S.scales.enps.val+100)/2});
+ const strength=wavg(comp);
+
+ // 2.2 Баланс
+ const balance=S.valid.paei||S.valid.arch? (bal.paei.score||0)+(bal.motiv.score||0) : null;
+
+ // 2.3 Сыгранность
+ const co=[];
+ if(S.valid.grani){const hij=[7,8,9].map(i=>S.scales.grani.perScale[i].med).filter(v=>v!=null);
+  if(hij.length)co.push({w:0.30,n:hij.reduce((a,b)=>a+TEAM_NORM.grani(b),0)/hij.length});}
+ if(S.valid.vovl){const cc=[2,3].map(i=>S.scales.vovl.perScale[i].med).filter(v=>v!=null);
+  if(cc.length)co.push({w:0.25,n:cc.reduce((a,b)=>a+TEAM_NORM.vovl(b),0)/cc.length});}
+ if(S.valid.enps&&S.scales.enps.n)co.push({w:0.20,n:(S.scales.enps.val+100)/2});
+ if(S.valid.paei)co.push({w:0.15,n:S.scales.paei.perScale[3].med});
+ if(S.valid.sale&&S.scales.sale.perScale[9].n)co.push({w:0.10,n:S.scales.sale.perScale[9].med});
+ const cohesion=wavg(co);
+
+ // 2.4 Риск
+ const burned=S.scales.vovl?shareIn(S.scales.vovl.index.list,v=>v<4):0;
+ const det=S.scales.enps?(S.scales.enps.n?S.scales.enps.d/S.scales.enps.n:0):0;
+ const mnw=N?members.filter(m=>m.matrix&&m.matrix.can>=6&&m.matrix.want<6).length/N:0;
+ const waiter=N?members.filter(m=>m.rez&&m.rez.type==="waiter").length/N:0;
+ const dataFlag=N?members.filter(m=>(m.grani&&m.grani.unreliable)||(m.vovl&&m.vovl.battery<=50)).length/N:0;
+ const pc=paeiCoverage(members);const missingRoles=pc.detail.filter(d=>d.pts===0).length;
+ const missContrib=Math.min(0.20,0.05*missingRoles);
+ const risk=100*(burned*0.25+det*0.15+mnw*0.15+waiter*0.15+dataFlag*0.10+missContrib);
+
+ return {
+  strength:strength==null?null:round(strength,0),
+  balance:balance==null?null:round(balance,0),
+  cohesion:cohesion==null?null:round(cohesion,0),
+  risk:round(risk,0),
+  parts:{burned,det,mnw,waiter,dataFlag,missingRoles,paeiCov:pc,motiv:bal.motiv}
+ };
+}
+function teamBalanceRaw(members,S){return {paei:paeiCoverage(members),motiv:motivCoverage(members)};}
+function wavg(comp){if(!comp.length)return null;const W=comp.reduce((a,c)=>a+c.w,0);if(!W)return null;return comp.reduce((a,c)=>a+c.w*c.n,0)/W;}
+
+// ---------- 3.1 балконы и подвалы ----------
+const GRANI_LETTERS=["A","B","C","D","E","F","G","H","I","J"];
+function allScales(S){ // -> [{test,label,src,medRaw,medNorm,pctUpper,pctLower,n}]
+ // только тесты с достаточным покрытием (cov≥60% и ≥3): низкое покрытие исключается из метрик (§1)
+ const out=[];const z=TEAM_CFG.zones;
+ const add=(test,label,stat,zone,normFn)=>{
+  if(!S.valid[test]||!stat||!stat.n)return;
+  out.push({test,label,src:test,medRaw:stat.med,medNorm:normFn(stat.med),
+   pctUpper:shareIn(stat.list,v=>v>=zone.up),pctLower:shareIn(stat.list,v=>v<=zone.lo),
+   n:stat.n,stat});
+ };
+ if(S.scales.rez)add("rez","Продуктивность",S.scales.rez.avg,z.rez,TEAM_NORM.rez);
+ if(S.scales.grani)S.scales.grani.perScale.forEach((s,i)=>add("grani","ГРАНИ "+GRANI_LETTERS[i]+" · "+GRANI_SCALES[i].name,s,z.grani,TEAM_NORM.grani));
+ if(S.scales.logika)add("logika","Интеллект (IQ)",S.scales.logika.iq,z.logika,TEAM_NORM.logika);
+ if(S.scales.sale)S.scales.sale.perScale.forEach((s,i)=>add("sale","СЕЙЛ · "+SALE_SCALES[i].name,s,z.sale,TEAM_NORM.sale));
+ if(S.scales.vovl)S.scales.vovl.perScale.forEach((s,i)=>add("vovl","ВОВЛ · "+VOVL_SCALES[i].name,s,z.vovl,TEAM_NORM.vovl));
+ if(S.scales.paei)S.scales.paei.perScale.forEach((s,i)=>add("paei","PAEI · "+PAEI_STYLES[i].name,s,z.paei,TEAM_NORM.paei));
+ if(S.scales.arch)S.scales.arch.perScale.forEach((s,i)=>add("arch","Архетип · "+ARCH_TYPES[i].name,s,z.arch,TEAM_NORM.arch));
+ return out;
+}
+function balconiesBasements(S){
+ const all=allScales(S);
+ const balc=all.filter(x=>x.medNorm!=null).slice().sort((a,b)=>b.medNorm-a.medNorm);
+ const base=all.filter(x=>x.medNorm!=null).slice().sort((a,b)=>a.medNorm-b.medNorm);
+ const isBalc=x=>x.pctUpper>=TEAM_CFG.balcony.share;
+ const isBase=x=>x.pctLower>=TEAM_CFG.basement.share;
+ return {
+  balconies:balc.slice(0,5).map(x=>Object.assign({},x,{flag:isBalc(x)})),
+  basements:base.slice(0,5).map(x=>Object.assign({},x,{flag:isBase(x)})),
+  systemicBasements:all.filter(isBase),
+  systemicBalconies:all.filter(isBalc),
+  all
+ };
+}
+
+// ---------- 3.2 модель четырёх функций ----------
+function fourFunctions(members){
+ const N=members.length; const c=TEAM_CFG.carrier;
+ const g=m=>m.grani?m.grani.std:null;
+ const carriers={
+  driver:members.filter(m=>(m.paei&&m.paei.sc[0]>=c.paei)||(m.arch&&m.arch.sums[3]>=c.heroDriver&&g(m)&&g(m)[4]>=c.grani&&g(m)[5]>=c.grani)),
+  order:members.filter(m=>(m.paei&&m.paei.sc[1]>=c.paei)||(m.arch&&(m.arch.sums[11]>=c.arch||m.arch.sums[10]>=c.arch)&&g(m)&&g(m)[0]>=c.grani)),
+  dev:members.filter(m=>(m.paei&&m.paei.sc[2]>=c.paei)||(m.arch&&(m.arch.sums[5]>=c.arch||m.arch.sums[1]>=c.arch||m.arch.sums[4]>=c.arch))),
+  glue:members.filter(m=>(m.paei&&m.paei.sc[3]>=c.paei)||(m.arch&&(m.arch.sums[6]>=c.arch||m.arch.sums[9]>=c.arch||m.arch.sums[8]>=c.arch)&&g(m)&&g(m)[8]>=c.grani))
+ };
+ const meta={driver:"Двигатель",order:"Порядок",dev:"Развитие",glue:"Клей"};
+ const out={};
+ Object.keys(carriers).forEach(k=>{
+  const cs=carriers[k];const status=cs.length===0?"gap":(cs.length/N>=0.25?"systemic":"one");
+  out[k]={name:meta[k],carriers:cs.map(m=>({id:m.id,name:m.name})),status,bus:status==="one"};
+ });
+ return out;
+}
+
+// ---------- 3.3 кого не хватает ----------
+function whoIsMissing(members,S,funcs,bb){
+ // роли/функции без носителя — «нужен человек»; подвалы/перекосы — «усилить»
+ const roleGaps=[],strengthen=[];
+ Object.values(funcs).forEach(f=>{if(f.status==="gap")roleGaps.push("функцию «"+f.name+"»");});
+ const pc=paeiCoverage(members);
+ pc.detail.forEach(d=>{if(d.pts===0)roleGaps.push("роль "+d.role+" (PAEI)");});
+ bb.basements.filter(x=>x.flag).slice(0,3).forEach(x=>strengthen.push(x.label));
+ if(S.valid.sale){const t=saleTypes(members);if(t.n){if(t.hunter/t.n>=TEAM_CFG.rules.hunterHi)roleGaps.push("«фермера» для удержания базы");else if(t.farmer/t.n>=TEAM_CFG.rules.farmerMin)roleGaps.push("«хантера» для наполнения воронки");}}
+ const profiles=[];
+ if(roleGaps.length)profiles.push("Команде нужен человек, закрывающий "+roleGaps.join(", ")+" — чтобы система работала без провалов.");
+ if(strengthen.length)profiles.push("Командно слабые зоны — усиливать при найме и развитии: "+strengthen.join(", ")+".");
+ return {gaps:roleGaps.concat(strengthen),roleGaps,strengthen,profiles};
+}
+function saleTypes(members){
+ const list=members.filter(m=>m.sale&&m.sale.type);
+ const c={hunter:0,farmer:0,universal:0,weak:0};list.forEach(m=>{c[m.sale.type]=(c[m.sale.type]||0)+1;});
+ return Object.assign({n:list.length},c);
+}
+
+// ---------- 3.5 на что обратить внимание ----------
+function attention(members,S,idx,funcs,bb){
+ const items=[];
+ const named=arr=>arr.map(m=>({id:m.id,name:m.name}));
+ // 1. риски потери людей
+ const burnedM=members.filter(m=>m.vovl&&m.vovl.index<4);
+ const mnwM=members.filter(m=>m.matrix&&m.matrix.can>=6&&m.matrix.want<6);
+ const detM=members.filter(m=>m.enps&&m.enps.cat==="detractor");
+ const lossSet=new Map();[...burnedM,...mnwM,...detM].forEach(m=>lossSet.set(m.id,m));
+ if(lossSet.size)items.push({w:100,cat:"Удержание",text:"Риск потери людей: "+lossSet.size+" чел.",people:[...lossSet.values()].map(m=>({id:m.id,name:m.name})),
+  action:"Диагностические беседы в приоритете: выгоревшие, «может-не-хочет», критики eNPS."});
+ // 2. незакрытые функции/роли
+ const gapF=Object.values(funcs).filter(f=>f.status==="gap");
+ if(gapF.length)items.push({w:80,cat:"Роли",text:"Не закрыты функции: "+gapF.map(f=>f.name).join(", "),people:[],action:"Нанять или развить носителя; см. «Кого не хватает»."});
+ // 3. системные подвалы
+ const sysBase=bb.basements.filter(x=>x.flag);
+ if(sysBase.length)items.push({w:70,cat:"Дефицит",text:"Системные подвалы: "+sysBase.map(x=>x.label).join(", "),people:[],action:"Это дефицит процесса, а не людей — вводить регламенты/контроль."});
+ // 4. поляризации
+ const polar=bb.all.filter(x=>x.pctUpper>=TEAM_CFG.polar.upper&&x.pctLower>=TEAM_CFG.polar.lower&&(1-x.pctUpper-x.pctLower)<TEAM_CFG.polar.mid);
+ if(polar.length)items.push({w:55,cat:"Раскол",text:"Поляризация по: "+polar.map(x=>x.label).join(", "),people:[],action:"Команда расколота по качеству — работать с двумя подгруппами по-разному."});
+ // 5. bus-факторы
+ const bus=Object.values(funcs).filter(f=>f.status==="one");
+ if(bus.length)items.push({w:45,cat:"Bus-фактор",text:"Функция держится на одном человеке: "+bus.map(f=>f.name+" ("+f.carriers[0].name+")").join(", "),
+  people:bus.map(f=>f.carriers[0]),action:"Риск при уходе — дублировать компетенцию, готовить второго носителя."});
+ // 6. качество данных
+ const lowCov=Object.keys(S.cov).filter(t=>S.present[t]>0&&!S.valid[t]);
+ const unrel=members.filter(m=>m.grani&&m.grani.unreliable).length;
+ if(lowCov.length||unrel)items.push({w:30,cat:"Данные",text:"Качество данных: "+(lowCov.length?("низкое покрытие ("+lowCov.map(t=>TEST_SHORT[t]).join(", ")+")"):"")+(unrel?(lowCov.length?"; ":"")+unrel+" ненадёжных профиля ГРАНИ":""),
+  people:[],action:"Дособрать тесты и перепройти ненадёжные — иначе выводы шаткие."});
+ return items.sort((a,b)=>b.w-a.w).slice(0,7);
+}
+
+// ---------- 3.4 согласованность мотивации ----------
+function motivConsistency(members){
+ const flags=[];
+ members.forEach(m=>{
+  if(m.arch&&m.vovl){
+   if(m.arch.motivation===1&&m.vovl.index<5)flags.push({id:m.id,name:m.name,t:"«достижение» + низкая вовлечённость: без вызовов уйдёт первым."});
+   if(m.arch.motivation===2&&((m.vovl.sc[2]<4)||(m.vovl.sc[3]<4)))flags.push({id:m.id,name:m.name,t:"«принадлежность» в слабом коллективе: живёт командой, а команда проседает."});
+  }
+ });
+ return flags;
+}
+
+// ---------- 4.x правила по тестам (Факт → Значение → Действие) ----------
+function fact(f,mean,act){return {f,mean,act};}
+function teamPerTest(members,S){
+ const N=members.length; const R=TEAM_CFG.rules; const out={};
+
+ if(S.present.rez){
+  const list=S.scales.rez.avg.list; const types={winner:0,doer:0,waiter:0};
+  members.forEach(m=>{if(m.rez&&m.rez.type)types[m.rez.type]++;});
+  const tn=types.winner+types.doer+types.waiter||1;
+  const rules=[];
+  const ws=types.winner/tn, ws2=types.waiter/tn;
+  if(ws>=R.winnerStrong)rules.push(fact("Победителей "+Math.round(ws*100)+"%","Сильный состав, есть кем прорываться.","Давайте им амбициозные цели и полномочия."));
+  if(ws<R.winnerWeak)rules.push(fact("Победителей <10%","Команде нечем прорываться, тянут исполнители.","Ищите/растите драйверов результата."));
+  if(ws>R.winnerFlood)rules.push(fact("Победителей >60%","Риск внутренней конкуренции и дефицита исполнителей рутины («все хотят рулить, некому возить»).","Балансируйте состав надёжными исполнителями."));
+  const waiters=members.filter(m=>m.rez&&m.rez.type==="waiter");
+  if(ws2>R.waiterBallast)rules.push(fact("Ожидающих "+Math.round(ws2*100)+"%","Балласт: издержки на управление превысят отдачу.","План исправления с жёстким сроком или расставание.",waiters));
+  out.rez={valid:S.valid.rez,cov:S.cov.rez,present:S.present.rez,med:S.scales.rez.avg.med,types,rules,waiters:waiters.map(m=>({id:m.id,name:m.name}))};
+ }
+
+ if(S.present.grani){
+  const ps=S.scales.grani.perScale; const rules=[];
+  const basementHints={A:"командные ошибки в деталях — нужен контроль качества процессом",B:"негативный климат — искать источник",C:"команда «горит» в авралы",D:"решения пересматриваются — нужен твёрдый лидер",E:"низкий темп",F:"незавершёнка — нужен трекинг",G:"размытая ответственность («никто не виноват»)",H:"культура споров и обесценивания",I:"продавливание людей, конфликтность",J:"молчащие совещания — проблемы не всплывают"};
+  ps.forEach((s,i)=>{if(s.n&&s.med<=TEAM_CFG.zones.grani.lo&&shareIn(s.list,v=>v<=TEAM_CFG.zones.grani.lo)>=TEAM_CFG.basement.share)
+   rules.push(fact("Подвал по шкале "+GRANI_LETTERS[i]+" («"+GRANI_SCALES[i].name+"»), медиана "+round(s.med,0),basementHints[GRANI_LETTERS[i]],"Компенсировать процессом/ролью, а не давлением."));});
+  const pdv=members.filter(m=>m.grani&&m.grani.pin).length/(S.present.grani||1);
+  if(pdv>R.granPdv)rules.push(fact("Профилей с ПДВ >"+Math.round(R.granPdv*100)+"%","Продуктивность команды зависит от климата.","Берегите рабочую среду, снижайте стресс-факторы."));
+  const unrel=members.filter(m=>m.grani&&m.grani.unreliable).length/(S.present.grani||1);
+  if(unrel>R.granUnrel)rules.push(fact("Ненадёжных профилей >"+Math.round(R.granUnrel*100)+"% (много «не знаю»)","Данные ГРАНИ шаткие.","Перепройти тест, объяснить важность честных ответов."));
+  if(ps[5].n&&ps[8].n&&ps[5].med>=TEAM_CFG.zones.grani.up&&ps[8].med<=0)rules.push(fact("Высокая Настойчивость (F) при низкой Чуткости (I)","Культура продавливания.","Добавить в процессы заботу о людях и правила эскалации."));
+  out.grani={valid:S.valid.grani,cov:S.cov.grani,present:S.present.grani,medians:ps.map(s=>s.med),rules};
+ }
+
+ if(S.present.logika){
+  const iq=S.scales.logika.iq; const rules=[];
+  const gap=(iq.max!=null&&iq.min!=null)?iq.max-iq.min:0;
+  if(gap>R.iqGap)rules.push(fact("Разрыв IQ "+Math.round(gap)+" пунктов","Когнитивный разрыв: сильные скучают, остальные не поспевают.","Делить материалы и задачи по уровням."));
+  if(iq.med!=null&&iq.med<95)rules.push(fact("Медиана IQ "+Math.round(iq.med)+" (<95)","Систематические ошибки в анализе при интеллектуальной работе.","Упрощать процессы, добавлять проверки."));
+  const sec=S.scales.logika.sections.map(s=>s.med||0); const secNames=["вербальный","числовой","логический","абстрактный"];
+  const sMax=Math.max(...sec),sMin=Math.min(...sec);
+  if(sMax-sMin>=4)rules.push(fact("Перекос секций: сильнее «"+secNames[sec.indexOf(sMax)]+"», слабее «"+secNames[sec.indexOf(sMin)]+"»","Командный когнитивный стиль.","Учитывать в коммуникациях и распределении задач."));
+  out.logika={valid:S.valid.logika,cov:S.cov.logika,present:S.present.logika,iq,sections:sec,rules};
+ }
+
+ if(S.present.sale){
+  const t=saleTypes(members); const rules=[]; const ps=S.scales.sale.perScale;
+  if(t.n){
+   if(t.hunter/t.n>=R.hunterHi)rules.push(fact("Хантеров "+Math.round(t.hunter/t.n*100)+"%","Некому удерживать базу — LTV падает.","Добавить «фермеров»/аккаунт-менеджеров."));
+   if(t.farmer/t.n>=R.farmerMin)rules.push(fact("Фермеров "+Math.round(t.farmer/t.n*100)+"%","Воронка не пополняется.","Добавить «хантеров» на привлечение."));
+  }
+  const lowRes=shareIn(ps[5].list,v=>v<=TEAM_CFG.zones.sale.lo);
+  if(lowRes>R.saleResultShare)rules.push(fact("«Результативность» ≤40 у "+Math.round(lowRes*100)+"%","Главный красный флаг отдела.","Разбирать воронку и мотивацию на результат."));
+  if(ps[0].med<=TEAM_CFG.zones.sale.lo&&ps[7].med<=TEAM_CFG.zones.sale.lo)rules.push(fact("Подвал «Организованность+Перфекционизм»","Хаос в CRM и документах.","Вводить регламенты, а не мотивацию."));
+  out.sale={valid:S.valid.sale,cov:S.cov.sale,present:S.present.sale,types:t,medians:ps.map(s=>s.med),rules};
+ }
+
+ if(S.present.vovl){
+  const idxS=S.scales.vovl.index; const ps=S.scales.vovl.perScale; const rules=[];
+  const cats={eng:0,loyal:0,neutral:0,burn:0};
+  members.forEach(m=>{if(m.vovl){const v=m.vovl.index;if(v>=8)cats.eng++;else if(v>=6)cats.loyal++;else if(v>=4)cats.neutral++;else cats.burn++;}});
+  const worst=ps.map((s,i)=>({i,med:s.med})).filter(x=>x.med!=null).sort((a,b)=>a.med-b.med).slice(0,3);
+  rules.push(fact("Худшие шкалы: "+worst.map(x=>VOVL_SCALES[x.i].name).join(", "),"Системные проблемы компании (не людей).","Работать с топ-3 худшими шкалами точечно."));
+  if(idxS.sd>R.vovlSdSplit)rules.push(fact("Разброс индекса SD "+round(idxS.sd,1),"Вовлечённость неоднородна — есть очаг.","Искать по руководителям/ролям."));
+  const burnM=members.filter(m=>m.vovl&&m.vovl.index<4);
+  if(cats.burn>=R.vovlBurnCluster)rules.push(fact(cats.burn+" выгоревших","«Зона заражения».","Срочные 1:1, устранять причины.",burnM));
+  const sinc=S.scales.vovl.battery.med;
+  if(sinc!=null&&sinc<=R.vovlSincerity)rules.push(fact("Средняя искренность "+Math.round(sinc)+"%","Люди боятся отвечать честно.","Повторить анонимно, работать над безопасностью."));
+  out.vovl={valid:S.valid.vovl,cov:S.cov.vovl,present:S.present.vovl,index:idxS,cats,medians:ps.map(s=>s.med),burned:burnM.map(m=>({id:m.id,name:m.name})),rules};
+ }
+
+ if(S.present.paei){
+  const ps=S.scales.paei.perScale; const rules=[]; const roles=["P","A","E","I"];
+  const names={P:"«много обсуждают, мало делают»",A:"«результат есть, системы нет: теряют, забывают, повторяют ошибки»",E:"«команда исполняет, но не развивается — устареет вместе с продуктом»",I:"«набор одиночек: конфликты не лечатся, знания не передаются»"};
+  const pc=paeiCoverage(members);
+  pc.detail.forEach((d,i)=>{if(d.pts===0&&ps[i].med<45)rules.push(fact("Нет носителя роли "+roles[i]+" (макс "+Math.round(d.max)+")",names[roles[i]],"Нанять/развить носителя роли "+roles[i]+"."));});
+  // монокультура по доминанте
+  const dom={};members.forEach(m=>{if(m.paei){const d=["P","A","E","I"][m.paei.dominant];dom[d]=(dom[d]||0)+1;}});
+  const domN=Object.values(dom).reduce((a,b)=>a+b,0)||1;
+  Object.keys(dom).forEach(k=>{if(dom[k]/domN>R.paeiMono)rules.push(fact("Монокультура "+k+" ("+Math.round(dom[k]/domN*100)+"%)","Общие слепые зоны доминанты "+k+".","Осознанно добавлять недостающие роли."));});
+  if(ps[0].med>=65&&ps[2].med>=65&&ps[1].med<45)rules.push(fact("Сильные P/E при слабом A","Хаос роста.","Усилить администрирование/процессы."));
+  if(ps[1].med>=65&&ps[2].med<35)rules.push(fact("Сильный A при слабом E","Бюрократизация.","Защитить пространство для изменений."));
+  const dead=members.filter(m=>m.paei&&m.paei.deadwood);
+  if(dead.length)rules.push(fact(dead.length+' профиль «−−−−»',"Управленческий сигнал (deadwood).","Срочный разговор, план или решение.",dead));
+  out.paei={valid:S.valid.paei,cov:S.cov.paei,present:S.present.paei,medians:ps.map(s=>s.med),coverage:pc,rules};
+ }
+
+ if(S.present.arch){
+  const gr=S.scales.arch.groups; const rules=[]; const gnames=ARCH_GROUPS.map(g=>g.name);
+  const groupCnt=[0,0,0,0];members.forEach(m=>{if(m.arch)groupCnt[m.arch.motivation]++;});
+  const gn=groupCnt.reduce((a,b)=>a+b,0)||1;
+  groupCnt.forEach((c,g)=>{if(c/gn>R.archMono)rules.push(fact("Моно-мотивация: «"+gnames[g].split(" ")[0]+"» ("+Math.round(c/gn*100)+"%)","Система мотивации должна быть заточена под неё; люди других групп будут выпадать.","Настроить рычаги под доминирующую группу, следить за «иными»."));});
+  const mc=motivCoverage(members);
+  const emptyNames={0:"«независимость» — мало самостоятельного поиска решений",1:"«достижение» — некому рваться к амбициозным целям",2:"«принадлежность» — холодный коллектив",3:"«стабильность» — некому достраивать и удерживать"};
+  mc.detail.forEach((d,g)=>{if(d.pts===0)rules.push(fact("Пустая группа мотивации: "+gnames[g].split(" ")[0],"Нет "+emptyNames[g]+".","Учитывать при следующем найме."));});
+  const top=gr.map((s,i)=>({i,med:s.med})).sort((a,b)=>b.med-a.med).slice(0,3);
+  out.arch={valid:S.valid.arch,cov:S.cov.arch,present:S.present.arch,groupMeds:gr.map(s=>s.med),groupCnt,topGroups:top,rules};
+ }
+
+ if(S.present.enps){
+  const e=S.scales.enps; const rules=[];
+  const band=e.val>=30?"отлично":e.val>=0?"норма":"тревога, вероятен отток";
+  rules.push(fact("eNPS "+e.val+"% ("+e.p+"↑ / "+e.pas+"→ / "+e.d+"↓)",band,e.val<0?"Разобрать причины оттока, срочные беседы с критиками.":"Поддерживать и закрывать частые претензии."));
+  const detr=members.filter(m=>m.enps&&m.enps.cat==="detractor");
+  if(detr.length)rules.push(fact("Критики: "+detr.length+" чел.","Сверить с вовлечённостью: высокая → локальная обида; низкая → кандидат на уход.","Персональные беседы.",detr));
+  out.enps={valid:S.valid.enps,cov:S.cov.enps,present:S.present.enps,val:e.val,p:e.p,pas:e.pas,d:e.d,detractors:detr.map(m=>({id:m.id,name:m.name})),rules};
+ }
+ return out;
+}
+
+// ---------- полный расчёт ----------
+function teamAnalyze(includeOnboarding){
+ const members=teamData(includeOnboarding);
+ if(members.length<TEAM_CFG.minTeam)return {members,tooFew:true};
+ const S=teamStats(members);
+ const idx=teamIndexes(members,S);
+ const bb=balconiesBasements(S);
+ const funcs=fourFunctions(members);
+ const missing=whoIsMissing(members,S,funcs,bb);
+ const attn=attention(members,S,idx,funcs,bb);
+ const motiv=motivConsistency(members);
+ const perTest=teamPerTest(members,S);
+ return {members,S,idx,bb,funcs,missing,attn,motiv,perTest,tooFew:false};
+}
+
+// ============================================================ UI: экран «Аналитика команды»
+let _teamOnb=false;
+function toggleTeamOnb(){_teamOnb=!_teamOnb;renderTeamAnalytics();}
+
+function _chip(p){return `<span class="tchip" style="cursor:pointer;display:inline-block;background:#eef2ff;color:#3730a3;border-radius:10px;padding:1px 8px;margin:2px 3px;font-size:12.5px;font-weight:600" onclick="go('emp','${p.id}')">👤 ${esc(p.name)}</span>`;}
+function _chips(arr){return arr&&arr.length?arr.map(_chip).join(""):'<span class="muted small">—</span>';}
+function _idxTile(title,val,sub){
+ if(val==null)return `<div class="card center"><h4>${title}</h4><div style="font-size:30px;font-weight:800;color:#94a3b8">—</div><div class="small muted">нет данных</div></div>`;
+ const c=title.indexOf("Риск")>=0?(val>=TEAM_CFG.riskRed?"#dc2626":val>=20?"#f59e0b":"#16a34a"):idxColor(val);
+ return `<div class="card center"><h4>${title}</h4><div style="font-size:34px;font-weight:800;color:${c}">${val}</div><div class="small muted">${sub||""}</div></div>`;
+}
+// горизонтальные бары медиан
+function _bars(items,opts){ // items:[{label,norm,raw,color?}]; opts.center — ось по центру
+ opts=opts||{};
+ return `<div style="display:flex;flex-direction:column;gap:4px;margin:8px 0">`+items.map(it=>{
+  const n=Math.max(0,Math.min(100,it.norm==null?0:it.norm));
+  const col=it.color||(n>=66?"#16a34a":n>=40?"#f59e0b":"#dc2626");
+  const bar=opts.center
+   ? `<div style="position:relative;height:14px;background:#f1f5f9;border-radius:7px;overflow:hidden"><div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#cbd5e1"></div><div style="position:absolute;top:0;bottom:0;${n>=50?"left:50%;width:"+(n-50)+"%":"right:50%;width:"+(50-n)+"%"};background:${col};border-radius:3px"></div></div>`
+   : `<div style="height:14px;background:#f1f5f9;border-radius:7px;overflow:hidden"><div style="height:100%;width:${n}%;background:${col};border-radius:7px"></div></div>`;
+  return `<div style="display:grid;grid-template-columns:160px 1fr 46px;gap:8px;align-items:center;font-size:12.5px">
+   <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(it.label)}">${esc(it.label)}</div>
+   ${bar}<div style="text-align:right;font-weight:700">${it.raw==null?"—":it.raw}</div></div>`;
+ }).join("")+`</div>`;
+}
+function _rules(rules){
+ if(!rules||!rules.length)return '<p class="small muted">Сработавших правил нет — по этому тесту команда без выраженных сигналов.</p>';
+ return rules.map(r=>`<div style="border-left:3px solid var(--brand,#4f46e5);padding:4px 0 4px 10px;margin:8px 0">
+  <div><b>Факт:</b> ${esc(r.f)}</div><div><b>Значит:</b> ${esc(r.mean)}</div><div><b>Действие:</b> ${esc(r.act)}</div>
+  ${r.people&&r.people.length?`<div style="margin-top:3px">${_chips(r.people)}</div>`:""}</div>`).join("");
+}
+function _cov(o){const p=Math.round((o.cov||0)*100);return `<span class="small ${o.valid?"muted":""}" style="${o.valid?"":"color:#dc2626"}">покрытие ${p}% (${o.present}) ${o.valid?"":"— мало данных, блок вне сводных индексов"}</span>`;}
+function _section(title,covObj,inner){
+ return `<details style="margin:10px 0;border:1px solid #e5e7eb;border-radius:10px;padding:6px 12px">
+  <summary style="cursor:pointer;font-weight:700;font-size:15px">${title} <span style="font-weight:400">· ${_cov(covObj)}</span></summary>
+  <div style="padding:8px 0">${inner}</div></details>`;
+}
+
+function renderTeamAnalytics(){
+ const A=teamAnalyze(_teamOnb);
+ const toolbar=`<div class="toolrow no-print" style="margin-bottom:10px">
+  <button class="btn sm sec" onclick="go('employees')">← К команде</button>
+  <label style="display:inline-flex;align-items:center;gap:6px;font-size:13.5px"><input type="checkbox" ${_teamOnb?"checked":""} onchange="toggleTeamOnb()"> включить онбординг</label>
+  <button class="btn sm" onclick="window.print()">🖨 Печать отчёта</button></div>`;
+ if(A.tooFew){
+  show(`<h1>Аналитика команды</h1>${toolbar}<div class="card center muted" style="margin-top:20px">Мало данных для командного анализа: в выборке ${A.members.length} чел. (нужно ≥${TEAM_CFG.minTeam}). Добавьте сотрудников в штат или включите онбординг.</div>`);
+  return;
+ }
+ const {S,idx,bb,funcs,missing,attn,motiv,perTest}=A;
+
+ // 1. индексы
+ const indexes=`<div class="sumrow">
+  ${_idxTile("Сила состава",idx.strength,"мощность команды")}
+  ${_idxTile("Баланс ролей",idx.balance,"полнота P/A/E/I + мотивация")}
+  ${_idxTile("Сыгранность",idx.cohesion,"насколько это команда")}
+  ${_idxTile("Риск",idx.risk,"чем выше — тем хуже")}
+ </div>
+ <p class="small muted">Выборка: ${S.N} чел.${_teamOnb?" (штат + онбординг)":" (штат)"}. Индексы 0–100; для «Риска» ≥${TEAM_CFG.riskRed} — красная зона.</p>`;
+
+ // 2. балконы/подвалы
+ const bbCol=(arr,pos)=>arr.length?arr.map(x=>`<div style="display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid #f1f5f9">
+   <span>${x.flag?(pos?"🟢 ":"🔴 "):""}${esc(x.label)}</span>
+   <span class="small muted" style="white-space:nowrap">${round(x.medRaw,0)} · ${Math.round((pos?x.pctUpper:x.pctLower)*100)}% ${pos?"↑":"↓"}</span></div>`).join(""):'<p class="small muted">—</p>';
+ const balc=`<div class="grid" style="grid-template-columns:1fr 1fr;gap:14px">
+  <div class="card"><h3 style="margin-top:0">🟢 Балконы (сильные стороны)</h3>${bbCol(bb.balconies,true)}</div>
+  <div class="card"><h3 style="margin-top:0">🔴 Подвалы (дефициты)</h3>${bbCol(bb.basements,false)}</div></div>`;
+
+ // 3. четыре функции
+ const fmeta={systemic:["✅","системно"," #16a34a"],one:["⚠️","держится на одном (bus-фактор)","#f59e0b"],gap:["❌","не закрыта","#dc2626"]};
+ const fcards=Object.values(funcs).map(f=>{const mt=fmeta[f.status];
+  return `<div class="card" style="border-top:3px solid ${mt[2]}"><h4 style="margin:0 0 4px">${mt[0]} ${f.name}</h4>
+   <div class="small" style="color:${mt[2]};font-weight:600">${mt[1]}</div>
+   <div style="margin-top:4px">${_chips(f.carriers)}</div></div>`;}).join("");
+ const functions=`<h2>Четыре функции команды</h2><div class="sumrow">${fcards}</div>`;
+
+ // 4. кого не хватает + на что обратить внимание
+ const miss=`<div class="card"><h3 style="margin-top:0">Кого не хватает</h3>
+  ${missing.profiles.length?missing.profiles.map(p=>`<p style="margin:6px 0">${esc(p)}</p>`).join(""):'<p class="small muted">Явных дефицитов ролей нет.</p>'}</div>`;
+ const attnList=`<div class="card"><h3 style="margin-top:0">На что обратить внимание</h3>
+  <ol style="margin:0;padding-left:20px">${attn.map(a=>`<li style="margin:6px 0"><b>[${esc(a.cat)}]</b> ${esc(a.text)}${a.people&&a.people.length?" — "+_chips(a.people):""}<div class="small muted">→ ${esc(a.action)}</div></li>`).join("")||'<li class="muted">Критичных пунктов нет.</li>'}</ol></div>`;
+ const motivBlock=motiv.length?`<div class="card"><h3 style="margin-top:0">Согласованность мотивации</h3>${motiv.map(m=>`<div style="padding:3px 0">${_chip(m)} — ${esc(m.t)}</div>`).join("")}</div>`:"";
+
+ // 5. секции по тестам
+ let sections="";
+ const g=perTest;
+ if(g.rez)sections+=_section("РЕЗУЛЬТАТИВ — продуктивность",g.rez,
+  `<p class="small">Медиана балла: <b>${g.rez.med==null?"—":round(g.rez.med,1)}</b> · Победители: ${g.rez.types.winner} · Исполнители: ${g.rez.types.doer} · Ожидающие: ${g.rez.types.waiter}</p>${_rules(g.rez.rules)}`);
+ if(g.grani)sections+=_section("ГРАНИ-10 — личность",g.grani,
+  _bars(g.grani.medians.map((v,i)=>({label:GRANI_LETTERS[i]+" "+GRANI_SCALES[i].name,raw:v==null?null:round(v,0),norm:v==null?null:TEAM_NORM.grani(v)})),{center:true})+_rules(g.grani.rules));
+ if(g.logika)sections+=_section("ЛОГИКА-80 — интеллект",g.logika,
+  `<p class="small">Медиана IQ <b>${g.logika.iq.med==null?"—":Math.round(g.logika.iq.med)}</b> · разброс ${g.logika.iq.min==null?"—":Math.round(g.logika.iq.min)}–${g.logika.iq.max==null?"—":Math.round(g.logika.iq.max)}</p>`+
+  _bars(["вербальный","числовой","логический","абстрактный"].map((n,i)=>({label:n,raw:round(g.logika.sections[i],0),norm:g.logika.sections[i]/20*100})))+_rules(g.logika.rules));
+ if(g.sale)sections+=_section("СЕЙЛ-ПРОФИЛЬ-12 — продажи",g.sale,
+  `<p class="small">Хантеров ${g.sale.types.hunter} · фермеров ${g.sale.types.farmer} · универсалов ${g.sale.types.universal} · слабых ${g.sale.types.weak}</p>`+
+  _bars(g.sale.medians.map((v,i)=>({label:SALE_SCALES[i].name,raw:v==null?null:round(v,0),norm:v})))+_rules(g.sale.rules));
+ if(g.vovl)sections+=_section("ВОВЛЕЧЁННОСТЬ-12",g.vovl,
+  `<p class="small">Индекс медиана <b>${g.vovl.index.med==null?"—":round(g.vovl.index.med,1)}</b> · вовлечённых ${g.vovl.cats.eng} · лояльных ${g.vovl.cats.loyal} · нейтральных ${g.vovl.cats.neutral} · выгоревших ${g.vovl.cats.burn}</p>`+
+  _bars(g.vovl.medians.map((v,i)=>({label:VOVL_SCALES[i].name,raw:v==null?null:round(v,1),norm:v==null?null:v*10})))+_rules(g.vovl.rules));
+ if(g.paei)sections+=_section("PAEI — управленческий стиль",g.paei,
+  _bars(g.paei.medians.map((v,i)=>({label:PAEI_STYLES[i].code+" "+PAEI_STYLES[i].name,raw:v==null?null:round(v,0),norm:v,color:PAEI_STYLES[i].color})))+_rules(g.paei.rules));
+ if(g.arch)sections+=_section("АРХЕТИПЫ-12 — мотивация",g.arch,
+  _bars(g.arch.groupMeds.map((v,i)=>({label:ARCH_GROUPS[i].name.split(" ")[0],raw:v==null?null:round(v,1),norm:v==null?null:TEAM_NORM.arch(v),color:ARCH_GROUPS[i].color})))+
+  `<p class="small muted">Людей по типам мотивации: ${g.arch.groupCnt.map((c,i)=>ARCH_GROUPS[i].name.split(" ")[0]+" "+c).join(" · ")}</p>`+_rules(g.arch.rules));
+ if(g.enps)sections+=_section("eNPS — лояльность",g.enps,
+  `<p class="small">eNPS <b>${g.enps.val}%</b> · ${g.enps.p} промоутеров · ${g.enps.pas} нейтралов · ${g.enps.d} критиков</p>${_rules(g.enps.rules)}`);
+
+ show(`<h1>Аналитика команды</h1>${toolbar}${indexes}
+  <h2>Балконы и подвалы</h2>${balc}
+  ${functions}
+  <div class="grid" style="grid-template-columns:1fr 1fr;gap:14px;margin-top:14px">${miss}${attnList}</div>
+  ${motivBlock}
+  <h2 style="margin-top:18px">Разбор по тестам</h2>${sections}`);
+ window.scrollTo(0,0);
+}
+
+// экспорт для node-тестов
+if(typeof module!=="undefined"&&module.exports){
+ module.exports={TEAM_CFG,TEAM_NORM,nstat,teamStats,teamIndexes,balconiesBasements,fourFunctions,
+  whoIsMissing,attention,motivConsistency,teamPerTest,teamAnalyze,paeiCoverage,motivCoverage,saleTypes};
+}
 
 </script>
 </body>
