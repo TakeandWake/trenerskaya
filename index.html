@@ -2919,7 +2919,7 @@ function seedDemoExtra(now,day){
   if(test==="grani")result=scoreGrani(answers);else if(test==="arch")result=scoreArch(answers);
   else if(test==="paei")result=scorePaei(answers);else if(test==="enps")result=scoreEnps(answers);
   const e=el.find(x=>x.id===empId);
-  h.push({id,test,resp:{name:e.name,pos:e.pos,mail:e.mail},date:now-(2+Math.random()*6)*day,spent:test==="grani"?2100:600,
+  h.push({id,test,resp:{name:e.name,pos:e.pos,mail:e.mail},date:Math.round(now-(2+Math.random()*6)*day),spent:test==="grani"?2100:600,
    answers,result,hr:{scores:hrScores||{},note:""},empId});
  };
  // c1: РЕЗУЛЬТАТИВ (сильный дуер/виннер)
@@ -3284,13 +3284,13 @@ function joinSubmit(testsStr,vacId){
 }
 // --- посев демо и очистка в облаке ---
 function seedIfEmpty(){
+ let flag="";try{flag=localStorage.getItem("hr_seeded_v1")||""}catch(e){}
+ if(flag==="cleared")return;
  if(CLOUD){
   if(EMPMODE)return;
   if(employees().length===0&&histAll().length===0&&vacancies().length===0)seedDemo(false);
   return;
  }
- let flag="";try{flag=localStorage.getItem("hr_seeded_v1")||""}catch(e){}
- if(flag==="cleared")return;
  if(employees().length===0&&histAll().length===0){seedDemo(false);return;}
  if(!getVac("v1")&&employees().some(e=>e.id==="d1")){
   const el=employees();el.forEach(e=>{if(/^d[1-5]$/.test(e.id)&&!e.stage)e.stage="staff";});setEmployees(el);
@@ -3301,7 +3301,7 @@ function wipeAll(){
  if(CLOUD&&!can("wipe")){alert("Очистка доступна только администратору");return;}
  if(!confirm("Удалить ВСЕХ людей, должности и ВСЕ результаты? Действие необратимо."))return;
  setHistory([]);setEmployees([]);setVacancies([]);
- if(!CLOUD){try{localStorage.setItem("hr_seeded_v1","cleared")}catch(e){}}
+ try{localStorage.setItem("hr_seeded_v1","cleared")}catch(e){}
  renderEmployees();
 }
 // --- старт ---
