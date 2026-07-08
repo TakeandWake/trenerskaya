@@ -2995,13 +2995,33 @@ function sbHeaders(json){
  if(json)h["Content-Type"]="application/json";
  return h;
 }
+// fetch с повтором при обрыве сети: Safari отдаёт «Load failed», Chrome — «Failed to fetch»,
+// когда запрос не дошёл до сервера (моргнула сеть, «холодный старт» уснувшего проекта Supabase).
+// Все наши запросы идемпотентны (upsert по id / on conflict do nothing), поэтому повтор безопасен.
+async function fetchRetry(url,opt,tries){
+ tries=tries||3;let lastErr;
+ for(let i=0;i<tries;i++){
+  try{return await fetch(url,opt);}
+  catch(e){lastErr=e;if(i<tries-1)await new Promise(r=>setTimeout(r,500*(i+1)));}
+ }
+ throw new Error("Сеть недоступна (попыток: "+tries+"). Проверьте интернет — изменения сохранятся при следующем действии.");
+}
+// перед запросом обновляем токен, если он вот-вот истечёт (иначе — внезапный 401 в середине работы)
+async function ensureToken(){
+ if(!SESSION||EMPMODE)return;
+ if(Date.now()<SESSION.expires_at)return;
+ try{const j=await authRequest("token?grant_type=refresh_token",{refresh_token:SESSION.refresh_token});storeSession(j);}
+ catch(e){}
+}
 async function sbGet(path){
- const r=await fetch(CONFIG.url+path,{headers:sbHeaders()});
+ await ensureToken();
+ const r=await fetchRetry(CONFIG.url+path,{headers:sbHeaders()});
  if(!r.ok)throw new Error(await sbFail(r));
  return r.json();
 }
 async function sbSend(method,path,body,prefer){
- const r=await fetch(CONFIG.url+path,{method,headers:Object.assign(sbHeaders(true),prefer?{Prefer:prefer}:{}),body:body!=null?JSON.stringify(body):undefined});
+ await ensureToken();
+ const r=await fetchRetry(CONFIG.url+path,{method,headers:Object.assign(sbHeaders(true),prefer?{Prefer:prefer}:{}),body:body!=null?JSON.stringify(body):undefined});
  if(!r.ok)throw new Error(await sbFail(r));
  const t=await r.text();return t?JSON.parse(t):null;
 }
@@ -3027,24 +3047,31 @@ const V2R=v=>({id:v.id,title:v.title,descr:v.desc||null,status:v.status||"open",
 const R2V=r=>({id:r.id,title:r.title,desc:r.descr||"",status:r.status,created:Number(r.created),questions:r.questions||[]});
 // --- диф-синхронизация кэш → облако ---
 const SHADOW={p:new Map(),r:new Map(),v:new Map()};
+// Считаем разницу, НЕ трогая shadow: строку помечаем «отправленной» только после успешного ответа.
+// Иначе неудачный запрос («Load failed») навсегда терял изменение — shadow уже думал, что всё сохранено.
 function diffCompute(list,shadow,toRow){
  const cur=new Map(list.map(x=>[x.id,x]));
  const ups=[],dels=[];
- cur.forEach((x,id)=>{const j=JSON.stringify(toRow(x));if(shadow.get(id)!==j){ups.push(toRow(x));shadow.set(id,j);}});
- shadow.forEach((_,id)=>{if(!cur.has(id)){dels.push(id);shadow.delete(id);}});
+ cur.forEach((x,id)=>{const j=JSON.stringify(toRow(x));if(shadow.get(id)!==j)ups.push({id,row:toRow(x),sig:j});});
+ shadow.forEach((_,id)=>{if(!cur.has(id))dels.push(id);});
  return {ups,dels};
 }
-function tableSync(table,d,wantKeys){
+function tableSync(table,shadow,d,wantKeys){
  if(d.ups.length){
-  sbSend("POST","/rest/v1/"+table,d.ups,"resolution=merge-duplicates"+(wantKeys?",return=representation":""))
+  sbSend("POST","/rest/v1/"+table,d.ups.map(u=>u.row),"resolution=merge-duplicates"+(wantKeys?",return=representation":""))
   .then(rows=>{
+   d.ups.forEach(u=>shadow.set(u.id,u.sig)); // успех — теперь строка синхронизирована
    if(wantKeys&&Array.isArray(rows)){ // подтянуть invite_key для новых людей
     const l=window._empMem||[];
     rows.forEach(r=>{const p=l.find(x=>x.id===r.id);if(p&&r.invite_key)p.inviteKey=r.invite_key;});
    }
   }).catch(syncFail);
  }
- if(d.dels.length)sbSend("DELETE","/rest/v1/"+table+"?id=in.("+encodeURIComponent(d.dels.map(x=>'"'+x+'"').join(","))+")").catch(syncFail);
+ if(d.dels.length){
+  sbSend("DELETE","/rest/v1/"+table+"?id=in.("+encodeURIComponent(d.dels.map(x=>'"'+x+'"').join(","))+")")
+  .then(()=>d.dels.forEach(id=>shadow.delete(id)))
+  .catch(syncFail);
+ }
 }
 // --- переопределение хранилища (кэш в памяти + облако; без облака — localStorage) ---
 function histAll(){
@@ -3057,12 +3084,14 @@ function setHistory(h){
  if(EMPMODE){ // сотрудник: новые результаты уходят через защищённую RPC
   h.forEach(rec=>{
    if(!SHADOW.r.has(rec.id)&&rec.result!==undefined){
-    SHADOW.r.set(rec.id,"sent");
-    rpc("submit_result",{p_id:rec.empId,p_key:EMPKEY,p_rec:REC2R(rec)}).catch(syncFail);
+    SHADOW.r.set(rec.id,"sending");
+    rpc("submit_result",{p_id:rec.empId,p_key:EMPKEY,p_rec:REC2R(rec)})
+     .then(()=>SHADOW.r.set(rec.id,"sent"))
+     .catch(e=>{SHADOW.r.delete(rec.id);syncFail(e);}); // не отправилось — снимем метку, повторим при следующем действии
    }});
   return;
  }
- tableSync("records",diffCompute(h,SHADOW.r,REC2R));
+ tableSync("records",SHADOW.r,diffCompute(h,SHADOW.r,REC2R));
 }
 function employees(){
  if(CLOUD)return window._empMem||[];
@@ -3072,7 +3101,7 @@ function setEmployees(l){
  window._empMem=l;
  if(!CLOUD){try{localStorage.setItem(KEY_EMP,JSON.stringify(l))}catch(e){}return;}
  if(EMPMODE)return;
- tableSync("people",diffCompute(l,SHADOW.p,P2R),true);
+ tableSync("people",SHADOW.p,diffCompute(l,SHADOW.p,P2R),true);
 }
 function saveEmp(emp){
  const l=employees();const i=l.findIndex(e=>e.id===emp.id);
@@ -3087,7 +3116,7 @@ function setVacancies(l){
  window._vacMem=l;
  if(!CLOUD){try{localStorage.setItem(KEY_VAC,JSON.stringify(l))}catch(e){}return;}
  if(EMPMODE)return;
- tableSync("vacancies",diffCompute(l,SHADOW.v,V2R));
+ tableSync("vacancies",SHADOW.v,diffCompute(l,SHADOW.v,V2R));
 }
 // --- авторизация админов/HR ---
 async function authRequest(path,body){
