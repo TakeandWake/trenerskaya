@@ -2843,6 +2843,8 @@ function renderEmpCard(id){
   <div>${esc(emp.pos||"Должность не указана")}${emp.mail?" · "+esc(emp.mail):""}${emp.phone?" · "+esc(emp.phone):""}</div>
   <div>в системе с ${fmtDate(emp.created)} · тестов пройдено: ${recs.length}</div></div>
   <div class="toolrow no-print">
+   <button class="btn sm" onclick="go('instruction','${id}')">📋 Инструкция по сотруднику</button>
+   <button class="btn sm sec" onclick="downloadAnswers('${id}')">⬇ Скачать ответы</button>
    <button class="btn sm sec" onclick="window.print()">🖨 Печать досье</button>
    <button class="btn sm sec" onclick="go('cabinet','${id}')">Кабинет сотрудника</button>
    <button class="btn sm sec" onclick="${backTo}">← Назад</button>
@@ -2867,6 +2869,7 @@ function renderForm(testId,empId){
  const t=TESTS[testId];
  const emp=empId?getEmp(empId):null;
  show(`<h1>${t.name}</h1><p class="sub">${t.tag}</p>
+ ${typeof honestyIntro==="function"?honestyIntro():""}
  <div class="card"><h3>Инструкция</h3><p>${t.instr}</p></div>
  <div class="card" style="margin-top:14px">
   ${emp?`<p>Тест проходит: <b>${esc(emp.name)}</b>${emp.pos?" · "+esc(emp.pos):""}</p>`:`
@@ -3225,6 +3228,7 @@ function go(screen,arg,arg2){
  else if(screen==="result")renderRecord(arg);
  else if(screen==="employees")renderEmployees();
  else if(screen==="team")renderTeamAnalytics();
+ else if(screen==="instruction")renderInstruction(arg);
  else if(screen==="emp")renderEmpCard(arg);
  else if(screen==="cabinet")renderCabinet(arg);
  else if(screen==="hiring")renderHiring();
@@ -3911,6 +3915,428 @@ function renderTeamAnalytics(){
 if(typeof module!=="undefined"&&module.exports){
  module.exports={TEAM_CFG,TEAM_NORM,nstat,teamStats,teamIndexes,balconiesBasements,fourFunctions,
   whoIsMissing,attention,motivConsistency,teamPerTest,teamAnalyze,paeiCoverage,motivCoverage,saleTypes};
+}
+// ============================================================ ПРОФИЛЬ СОТРУДНИКА: должности, интерпретация, инструкция, выгрузка
+// Синтез по всем тестам: подбор должностей/ролей + «Инструкция по сотруднику» +
+// скачивание ответов и инструкции в Word. Использует уже загруженные банки вопросов и
+// авторские интерпретации (PAEI_STYLES, ARCH_TYPES/GROUPS, GRANI_SCALES, REZ_TYPOLOGY).
+
+const PAEI_ROLE_NAME={P:"Производитель",A:"Администратор",E:"Предприниматель",I:"Интегратор"};
+const GRANI_IDX={A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9};
+
+// ---------- нормализованный профиль сотрудника ----------
+function empProfile(id){
+ const g=(t)=>{const r=lastRec(id,t);return r?r.result:null;};
+ const rezR=lastRec(id,"rez");
+ let rez=null;
+ if(rezR){const sc=Object.values(rezR.hr.scores||{}).map(Number).filter(v=>!isNaN(v));
+  rez={avg:sc.length?sc.reduce((a,b)=>a+b,0)/sc.length:null,type:rezTypology(rezR.answers)};}
+ const paei=g("paei"),arch=g("arch"),grani=g("grani"),logika=g("logika"),vovl=g("vovl"),sale=g("sale");
+ const P={
+  id,name:(getEmp(id)||{}).name||"",pos:(getEmp(id)||{}).pos||"",
+  paei:paei?{sc:paei.sc,code:paei.code,dominant:paei.dominant,deadwood:paei.deadwood,warn:paei.warn}:null,
+  arch:arch?{sums:arch.sums,groups:arch.groups,motivation:arch.motivation,top:arch.top,flat:arch.flat}:null,
+  grani:grani?{std:grani.std,unreliable:grani.unreliable,pin:grani.pin,
+   strong:grani.std.map((v,i)=>v>=32?i:-1).filter(i=>i>=0),
+   weak:grani.std.map((v,i)=>v<=-32?i:-1).filter(i=>i>=0)}:null,
+  logika:logika?{iq:logika.iq,band:logika.band,sections:logika.sections}:null,
+  vovl:vovl?{index:vovl.index,battery:vovl.battery,sc:vovl.sc,
+   worst:vovl.sc.map((v,i)=>({v,i})).sort((a,b)=>a.v-b.v).slice(0,3).map(x=>x.i)}:null,
+  sale:sale?{sc:sale.sc,type:sale.type}:null
+ };
+ P.hasAny=!!(paei||arch||grani||logika||vovl||sale||rez);
+ P.rez=rez;
+ return P;
+}
+function paeiRole(P,role){return P.paei?P.paei.sc[{P:0,A:1,E:2,I:3}[role]]:null;}
+function topArchName(P){return P.arch?P.arch.top.map(i=>ARCH_TYPES[i].name).join("/"):null;}
+function motivName(P){return P.arch?ARCH_GROUPS[P.arch.motivation].name:null;}
+
+// ---------- БАЗА ДОЛЖНОСТЕЙ ----------
+// need.paei: роли, которые должны быть сильны; avoidWeak: роли, слабость которых критична.
+// motiv: предпочтительные группы мотивации (0 независимость,1 достижение,2 принадлежность,3 стабильность).
+// grani: {индекс:'hi'|'lo'} — какие личностные шкалы важны. iqMin — порог интеллекта. sale — тип продавца.
+const POSITIONS=[
+ {id:"coo",title:"Операционный директор / COO",family:"Управление",
+  need:{paei:["A","P"],motiv:[1,3],grani:{F:"hi",G:"hi",A:"hi"},iqMin:105},
+  tasks:"Систематизация процессов, масштабирование, координация подразделений, наведение порядка в растущей компании.",
+  why:"Соединяет результат и порядок: строит систему, в которой команда выдаёт максимум без ручного управления."},
+ {id:"founder",title:"Руководитель нового направления / Предприниматель",family:"Управление",
+  need:{paei:["E","P"],motiv:[1,0],grani:{E:"hi",D:"hi"},iqMin:110},
+  tasks:"Запуск новых продуктов и рынков, пилоты, развитие с нуля, просчитанные риски.",
+  why:"Видит возможности раньше других и берёт на себя риск ради кратного роста."},
+ {id:"rop",title:"Руководитель отдела продаж (РОП)",family:"Продажи",
+  need:{paei:["P","I"],motiv:[1],grani:{E:"hi",F:"hi",J:"hi"},iqMin:100,sale:"universal"},
+  tasks:"Управление командой продаж, план и мотивация, личный пример в сложных сделках, разбор воронки.",
+  why:"Играющий тренер: ведёт команду к цифрам и сам показывает стандарт."},
+ {id:"hunter",title:"Менеджер по продажам — привлечение (хантер)",family:"Продажи",
+  need:{paei:["P"],motiv:[1],grani:{E:"hi",F:"hi",C:"hi"},sale:"hunter"},
+  tasks:"Холодный поиск, первые сделки, выход на новых клиентов, работа с отказами.",
+  why:"Заряжен на новые контакты и не боится «нет»."},
+ {id:"farmer",title:"Менеджер по работе с клиентами (фермер / аккаунт)",family:"Продажи",
+  need:{paei:["I","A"],motiv:[2,3],grani:{I:"hi",A:"hi",B:"hi"},sale:"farmer"},
+  tasks:"Развитие и удержание базы, допродажи, забота о клиенте, долгие отношения.",
+  why:"Строит доверие и растит выручку с существующих клиентов."},
+ {id:"marketing",title:"Маркетолог",family:"Маркетинг",
+  need:{paei:["E"],motiv:[0,1],grani:{E:"hi"},iqMin:105},
+  tasks:"Кампании, гипотезы, воронка, контент, аналитика лидов.",
+  why:"Генерирует идеи и проверяет их на цифрах."},
+ {id:"analyst",title:"Аналитик / Data",family:"Аналитика",
+  need:{paei:["A"],motiv:[0,3],grani:{A:"hi",H:"hi"},iqMin:112},
+  tasks:"Работа с данными, отчётность, разбор нестандартных задач, поиск закономерностей.",
+  why:"Точность, объективность и высокий интеллект — основа качественного анализа."},
+ {id:"finance",title:"Финансист / Бухгалтер",family:"Финансы",
+  need:{paei:["A"],motiv:[3],grani:{A:"hi",G:"hi",C:"hi"},iqMin:100},
+  tasks:"Учёт, документы, регламенты, контроль сроков и цифр.",
+  why:"Порядок, внимательность и ответственность — там, где цена ошибки высока."},
+ {id:"pm",title:"Проджект / Продакт-менеджер",family:"Управление",
+  need:{paei:["A","E","I"],motiv:[1,0],grani:{F:"hi",G:"hi",J:"hi"},iqMin:108},
+  tasks:"Ведение проектов, синхронизация команд, дедлайны, баланс идей и исполнения.",
+  why:"Держит проект между хаосом идей и жёсткими сроками."},
+ {id:"hr",title:"HR / Рекрутер",family:"Люди",
+  need:{paei:["I"],motiv:[2],grani:{I:"hi",J:"hi",H:"hi"}},
+  tasks:"Подбор, адаптация, климат в команде, разрешение конфликтов.",
+  why:"Чувствует людей и объединяет команду."},
+ {id:"support",title:"Специалист поддержки / Сервис",family:"Люди",
+  need:{paei:["I","A"],motiv:[2,3],grani:{B:"hi",C:"hi",I:"hi"}},
+  tasks:"Работа с обращениями, забота о клиенте, стабильное качество сервиса.",
+  why:"Спокойствие, доброжелательность и терпение в потоке обращений."},
+ {id:"mentor",title:"Наставник / Тренер команды",family:"Люди",
+  need:{paei:["I","P"],motiv:[2,1],grani:{J:"hi",I:"hi",G:"hi"},iqMin:105},
+  tasks:"Обучение новичков, передача стандартов, развитие сотрудников.",
+  why:"Умеет объяснять, вести за собой и делиться опытом."},
+ {id:"admin",title:"Администратор офиса / Операционный ассистент",family:"Порядок",
+  need:{paei:["A"],motiv:[3,2],grani:{A:"hi",G:"hi"}},
+  tasks:"Документооборот, регламенты, поддержка процессов, «закрытие деталей».",
+  why:"Надёжный тыл: держит порядок там, где другим скучно."},
+ {id:"specialist",title:"Эксперт / Специалист-предметник",family:"Экспертиза",
+  need:{paei:["P"],motiv:[0],grani:{A:"hi",H:"hi"},iqMin:110},
+  tasks:"Глубокая предметная работа, качество, самостоятельные решения в своей области.",
+  why:"Погружается в суть и выдаёт экспертный результат без надзора."}
+];
+
+// оценка соответствия должности (0..1) + причины
+function fitPosition(P,pos){
+ const parts=[]; const reasons={plus:[],minus:[]}; const n=pos.need;
+ // PAEI
+ if(n.paei&&P.paei){
+  let s=0,c=0;n.paei.forEach(role=>{const v=paeiRole(P,role);c++;const sub=Math.max(0,Math.min(1,v/70));s+=sub;
+   if(v>=65)reasons.plus.push("сильная роль "+role+" ("+PAEI_ROLE_NAME[role]+")");else if(v<35)reasons.minus.push("слабая роль "+role);});
+  parts.push({w:0.32,s:s/c});
+ }
+ // мотивация
+ if(n.motiv&&P.arch){
+  const inSet=n.motiv.includes(P.arch.motivation);
+  const grpVals=n.motiv.map(g=>P.arch.groups[g]);const best=Math.max(...grpVals);
+  const s=inSet?1:Math.max(0,Math.min(1,(best-15)/12));
+  parts.push({w:0.22,s});
+  if(inSet)reasons.plus.push("мотивация «"+ARCH_GROUPS[P.arch.motivation].name.split(" ")[0]+"» совпадает");
+  else reasons.minus.push("ведущая мотивация иная («"+ARCH_GROUPS[P.arch.motivation].name.split(" ")[0]+"»)");
+ }
+ // GRANI
+ if(n.grani&&P.grani){
+  const keys=Object.keys(n.grani);let s=0;
+  keys.forEach(k=>{const v=P.grani.std[GRANI_IDX[k]];const want=n.grani[k];
+   let sub;if(want==="hi"){sub=Math.max(0,Math.min(1,(v+32)/96+ (v>=32?0.2:0)));if(v>=32)reasons.plus.push(GRANI_SCALES[GRANI_IDX[k]].name.toLowerCase());if(v<=-32)reasons.minus.push("низкая "+GRANI_SCALES[GRANI_IDX[k]].name.toLowerCase());}
+   else{sub=Math.max(0,Math.min(1,(32-v)/96));}
+   s+=Math.min(1,sub);});
+  parts.push({w:0.24,s:s/keys.length});
+ }
+ // IQ
+ if(n.iqMin&&P.logika){const v=P.logika.iq;const s=Math.max(0,Math.min(1,(v-(n.iqMin-15))/30));
+  parts.push({w:0.12,s});if(v>=n.iqMin)reasons.plus.push("интеллект соответствует");else if(v<n.iqMin-10)reasons.minus.push("интеллект ниже требуемого");}
+ // продажи
+ if(n.sale&&P.sale){const s=P.sale.type===n.sale?1:(P.sale.type==="universal"?0.7:P.sale.type==="weak"?0.15:0.4);
+  parts.push({w:0.20,s});if(P.sale.type===n.sale||P.sale.type==="universal")reasons.plus.push("профиль продаж подходит");else reasons.minus.push("иной тип продавца");}
+ if(!parts.length)return null;
+ const W=parts.reduce((a,p)=>a+p.w,0);
+ const fit=parts.reduce((a,p)=>a+p.w*p.s,0)/W;
+ return {fit:Math.round(fit*100),reasons,covered:parts.length};
+}
+function fitPositions(P){
+ return POSITIONS.map(pos=>({pos,r:fitPosition(P,pos)})).filter(x=>x.r).sort((a,b)=>b.r.fit-a.r.fit);
+}
+
+// ---------- ИНСТРУКЦИЯ ПО СОТРУДНИКУ ----------
+function buildInstruction(id){
+ const P=empProfile(id);
+ if(!P.hasAny)return {P,empty:true};
+ const S={};
+ const has=P;
+ // 1. Архетип и суперсила
+ const archPart=P.arch?ARCH_TYPES[P.arch.top[0]]:null;
+ const domRole=P.paei?["P","A","E","I"][P.paei.dominant]:null;
+ let superName="";
+ if(archPart&&domRole)superName=archPart.name+" · "+PAEI_ROLE_NAME[domRole];
+ else if(archPart)superName=archPart.name;
+ else if(domRole)superName=PAEI_ROLE_NAME[domRole];
+ else superName="Профиль формируется";
+ let superText=[];
+ if(archPart)superText.push(archPart.d);
+ if(P.paei)superText.push("Ведущая управленческая роль — "+PAEI_ROLE_NAME[domRole].toLowerCase()+" (код "+P.paei.code+").");
+ if(P.logika)superText.push("Интеллект: "+P.logika.band.toLowerCase()+" (IQ "+P.logika.iq+").");
+ S.super={name:superName,text:superText.join(" ")};
+
+ // 2. Где даст лучший результат — топ должностей
+ const fits=fitPositions(P);
+ S.where=fits.slice(0,3).map(f=>({title:f.pos.title,fit:f.r.fit,tasks:f.pos.tasks,why:f.pos.why}));
+ S.whereWeak=fits.slice(-2).filter(f=>f.r.fit<45).map(f=>f.pos.title);
+
+ // 3. Риски (личностные/ролевые)
+ const risks=[];
+ if(P.paei){["P","A","E","I"].forEach((role,i)=>{if(P.paei.sc[i]<35)risks.push("Слабая роль "+role+" ("+PAEI_ROLE_NAME[role]+"): "+PAEI_STYLES[i].low.d.toLowerCase());});}
+ if(P.grani)P.grani.weak.forEach(i=>risks.push(GRANI_SCALES[i].name+": "+GRANI_SCALES[i].low.d.toLowerCase()));
+ if(P.grani&&P.grani.pin)risks.push("Продуктивность зависит от эмоционального состояния (ПДВ): в стрессе эффективность резко падает.");
+ if(P.vovl&&P.vovl.index<5)risks.push("Пониженная вовлечённость (индекс "+P.vovl.index+"/10): риск снижения отдачи и ухода.");
+ S.risks=risks.length?risks:["Выраженных зон риска по пройденным тестам не выявлено."];
+
+ // 4. Совместимость / кого поставить рядом
+ const compat=[];
+ if(P.paei){
+  if(P.paei.sc[1]<35)compat.push("Нужен сильный Администратор (A) рядом — иначе утонет в деталях: документы, регламенты, контроль сроков.");
+  if(P.paei.sc[0]<35)compat.push("Результат должен обеспечивать кто-то другой — сам «производить» будет мало.");
+  if(P.paei.sc[2]>=65&&P.paei.sc[1]<50)compat.push("Много идей при слабом порядке — поставьте рядом исполнительного A/P, который доведёт до результата.");
+  if(P.paei.sc[3]<35)compat.push("Работу с людьми и климат лучше не делегировать ему — дайте роль эксперта, а не связующего звена.");
+ }
+ if(P.arch){
+  const g=P.arch.motivation;
+  if(g===0)compat.push("Среда: максимум автономии и осмысленных задач, минимум микроконтроля.");
+  if(g===1)compat.push("Среда: амбициозные цели, признание результата, право менять; без вызова заскучает.");
+  if(g===2)compat.push("Среда: здоровая команда и человеческое отношение; в токсичной среде уйдёт первым.");
+  if(g===3)compat.push("Среда: понятные правила, ресурсы и горизонт планирования; в хаосе теряет эффективность.");
+ }
+ S.compat=compat.length?compat:["Особых требований к среде по данным тестов не выявлено."];
+
+ // 6. Общий вердикт
+ let verdict="";
+ if(archPart&&P.paei){
+  const mv=motivName(P);
+  verdict="Ведущий тип — "+superName+". Для полной отдачи ему нужны: "+
+   (P.arch?ARCH_GROUPS[P.arch.motivation].motiv.toLowerCase():"понятные условия")+
+   (P.paei.sc[1]<35?", и надёжный административный тыл":"")+". "+
+   (P.logika?"Интеллект "+P.logika.band.toLowerCase()+" позволяет доверять сложные задачи.":"");
+ } else verdict="Профиль пройден частично — вердикт уточнится по мере прохождения остальных тестов.";
+ S.verdict=verdict;
+
+ // 7. Сильные стороны (чего ждать)
+ const strengths=[];
+ if(P.rez&&P.rez.type)strengths.push(REZ_TYPOLOGY[P.rez.type].name+" по продуктивности: "+REZ_TYPOLOGY[P.rez.type].w.split(".")[0]+".");
+ if(P.paei){["P","A","E","I"].forEach((role,i)=>{if(P.paei.sc[i]>=65)strengths.push(PAEI_ROLE_NAME[role]+" (сильная роль): "+PAEI_STYLES[i].high.d.toLowerCase());});}
+ if(P.grani)P.grani.strong.slice(0,5).forEach(i=>strengths.push(GRANI_SCALES[i].name+": "+GRANI_SCALES[i].high.d.toLowerCase()));
+ if(P.logika&&P.logika.iq>=110)strengths.push("Высокий интеллект: быстро осваивает новое, справляется со сложными многошаговыми задачами.");
+ if(P.sale&&P.sale.type)strengths.push("Продажи — тип «"+({hunter:"хантер",farmer:"фермер",universal:"универсал",weak:"слабый"})[P.sale.type]+"».");
+ S.strengths=strengths.length?strengths:["Сильные стороны уточнятся после прохождения ключевых тестов (PAEI, ГРАНИ, продуктивность)."];
+
+ // 8. Сценарии-риски (к чему готовиться)
+ const scen=[];
+ if(P.arch){const g=P.arch.motivation;
+  if(g===1)scen.push("«Скука и уход»: на стабильном плато без новых вызовов вовлечённость падает — начнёт искать движ на стороне.");
+  if(g===0)scen.push("«Клетка»: при жёстких рамках и микроконтроле потеряет мотивацию и отдачу.");
+  if(g===2)scen.push("«Токсичная среда»: конфликты и несправедливость в команде выбьют его быстрее, чем деньги удержат.");
+  if(g===3)scen.push("«Хаос»: постоянные изменения без опоры и правил снижают его эффективность.");
+ }
+ if(P.paei&&P.paei.sc[1]<35)scen.push("«Операционный коллапс»: без административной поддержки начнёт терять документы, сроки и договорённости.");
+ if(P.vovl&&P.vovl.index<5)scen.push("«Тихий уход»: пониженная вовлечённость может перейти в формальное исполнение и поиск другого места.");
+ S.scenarios=scen.length?scen:["Явных рисковых сценариев по данным тестов не просматривается."];
+
+ // 9.1 Как ставить задачи (по ведущей роли PAEI)
+ const taskStyle={
+  P:"Ставьте через конкретный измеримый результат и сроки-вехи; минимум лишних обсуждений — он хочет делать, а не совещаться.",
+  A:"Давайте чёткие требования, регламент и критерии качества; цените порядок и предсказуемость, избегайте резких изменений «на ходу».",
+  E:"Ставьте через образ цели и смысл («зачем и куда идём»), давайте свободу в способах; жёсткие пошаговые инструкции убивают его мотивацию.",
+  I:"Ставьте задачи, связанные с людьми и командой; подсвечивайте, как результат повлияет на отношения и атмосферу."
+ };
+ S.setTasks=domRole?taskStyle[domRole]:"Уточните стиль постановки после прохождения PAEI-теста.";
+
+ // 9.2 Модель управления
+ let mgmt="";
+ if(P.paei){
+  const auto=P.paei.sc[2]>=60||(P.arch&&P.arch.motivation===0)?"высокая автономия, контроль по итогам, минимум вмешательства в процесс":
+   P.paei.sc[1]>=60?"чёткие процессы и регулярный контроль по чек-листам":"баланс поддержки и свободы, еженедельная синхронизация";
+  mgmt="Модель управления: "+auto+". "+(P.paei.sc[2]>=60?"Не лезьте в микро-процессы — оценивайте по результату и цифрам.":"");
+ } else mgmt="Модель управления уточнится после PAEI-теста.";
+ S.management=mgmt;
+
+ // 9.3 Как мотивировать (по группе мотивации архетипов)
+ S.motivate=P.arch?ARCH_GROUPS[P.arch.motivation].w:"Определится после теста «Архетипы».";
+
+ // 9.4 Как предотвратить выгорание
+ const burn=[];
+ if(P.arch){const g=P.arch.motivation;
+  if(g===1)burn.push("Каждые 6–12 месяцев давайте новую вершину/вызов; отправляйте на профильные мероприятия.");
+  if(g===0)burn.push("Оберегайте автономию и разнообразие задач; не загоняйте в рутину и рамки.");
+  if(g===2)burn.push("Поддерживайте здоровое «ядро» коллег и личное признание; следите за атмосферой.");
+  if(g===3)burn.push("Давайте стабильность, ресурсы и понятный горизонт; дозируйте изменения.");
+ }
+ if(P.vovl){P.vovl.worst.forEach(i=>burn.push("Слабая зона вовлечённости — «"+VOVL_SCALES[i].name+"»: обсудить и закрыть в ближайший квартал."));}
+ if(P.grani&&P.grani.pin)burn.push("Берегите эмоциональную среду — его продуктивность чувствительна к стрессу.");
+ S.burnout=burn.length?burn:["Специфических факторов выгорания не выявлено; поддерживайте обычную обратную связь и рост."];
+
+ // 10. Конфликтные триггеры
+ const trig=[];
+ if(P.arch){const t0=P.arch.top[0];
+  if([4].includes(t0))trig.push("Бюрократия и «так принято»: формальности ради формальностей вызовут сопротивление.");
+  if([11,9].includes(t0))trig.push("Подрыв его авторитета/субординации: отмена решений через его голову — публичное лишение власти.");
+  if([1,5].includes(t0))trig.push("Монотонность и запрет на эксперимент: лишите нового — потеряете вовлечённость.");
+ }
+ if(P.paei){
+  if(P.paei.sc[2]>=60)trig.push("Эмоциональный/интуитивный менеджмент вместо цифр обесценит стратегию в его глазах.");
+  if(P.paei.sc[1]>=60)trig.push("Хаос и постоянная смена правил без системы будут его раздражать.");
+  if(P.paei.sc[0]>=60&&P.paei.sc[3]<40)trig.push("Долгие обсуждения без действия воспринимаются как трата времени.");
+ }
+ if(P.grani&&P.grani.std[GRANI_IDX.F]>=32&&P.grani.std[GRANI_IDX.I]<=0)trig.push("Продавливание: в спорах может идти напролом — конфликты с чувствительными коллегами.");
+ S.triggers=trig.length?trig:["Явных конфликтных триггеров по данным тестов не выявлено."];
+
+ S.coverage={paei:!!P.paei,arch:!!P.arch,grani:!!P.grani,logika:!!P.logika,vovl:!!P.vovl,sale:!!P.sale,rez:!!(P.rez&&P.rez.type)};
+ return {P,S,fits,empty:false};
+}
+
+// ---------- РЕНДЕР ИНСТРУКЦИИ ----------
+function renderInstruction(id){
+ const emp=getEmp(id);if(!emp){show("<p>Человек не найден.</p>");return;}
+ const I=buildInstruction(id);
+ const back=`<div class="toolrow no-print" style="margin-bottom:10px">
+  <button class="btn sm sec" onclick="go('emp','${id}')">← К карточке</button>
+  <button class="btn sm" onclick="downloadInstruction('${id}')">⬇ Скачать инструкцию (Word)</button>
+  <button class="btn sm sec" onclick="downloadAnswers('${id}')">⬇ Скачать ответы (Word)</button>
+  <button class="btn sm sec" onclick="window.print()">🖨 Печать</button></div>`;
+ if(I.empty){show(`<h1>Инструкция по сотруднику</h1>${back}<div class="card center muted" style="margin-top:20px">${esc(emp.name)} ещё не проходил(а) тесты — инструкция формируется по мере их прохождения.</div>`);return;}
+ const S=I.S;
+ const done=Object.keys(S.coverage).filter(k=>S.coverage[k]).map(k=>({paei:"PAEI",arch:"Архетипы",grani:"ГРАНИ",logika:"Логика",vovl:"Вовлечённость",sale:"Сейл",rez:"Результатив"})[k]);
+ const missing=Object.keys(S.coverage).filter(k=>!S.coverage[k]).map(k=>({paei:"PAEI",arch:"Архетипы",grani:"ГРАНИ",logika:"Логика",vovl:"Вовлечённость",sale:"Сейл",rez:"Результатив"})[k]);
+ const ul=arr=>`<ul style="margin:6px 0 12px;padding-left:20px">${arr.map(x=>"<li style='margin:4px 0'>"+esc(x)+"</li>").join("")}</ul>`;
+ const where=S.where.map(w=>`<li style="margin:6px 0"><b>${esc(w.title)}</b> <span class="badge z-vhigh">совпадение ${w.fit}%</span><div class="small">${esc(w.tasks)}</div><div class="small muted">${esc(w.why)}</div></li>`).join("");
+ show(`<h1>Инструкция по сотруднику: ${esc(emp.name)}</h1>${back}
+  <p class="small muted">Синтез по тестам: ${done.join(", ")||"—"}.${missing.length?" Ещё не пройдены: "+missing.join(", ")+" (инструкция дополнится).":""}</p>
+
+  <h2>Часть 1. Коротко о главном</h2>
+  <div class="card"><h3 style="margin-top:0">1. Архетип и суперсила: ${esc(S.super.name)}</h3><p>${esc(S.super.text)}</p></div>
+  <div class="card"><h3 style="margin-top:0">2. Где даст лучший результат</h3><ul style="margin:6px 0;padding-left:20px">${where}</ul>${S.whereWeak.length?`<p class="small muted">Менее подходящие роли: ${S.whereWeak.map(esc).join(", ")}.</p>`:""}</div>
+  <div class="card"><h3 style="margin-top:0">3. Риски</h3>${ul(S.risks)}</div>
+  <div class="card"><h3 style="margin-top:0">4. Совместимость и среда</h3>${ul(S.compat)}</div>
+
+  <h2>Часть 2. Инструкция по управлению</h2>
+  <div class="card"><h3 style="margin-top:0">Общий вердикт</h3><p>${esc(S.verdict)}</p></div>
+  <div class="card"><h3 style="margin-top:0">Чего ждать (сильные стороны)</h3>${ul(S.strengths)}</div>
+  <div class="card"><h3 style="margin-top:0">Главные риски (сценарии)</h3>${ul(S.scenarios)}</div>
+  <div class="card"><h3 style="margin-top:0">Как ставить задачи</h3><p>${esc(S.setTasks)}</p></div>
+  <div class="card"><h3 style="margin-top:0">Модель управления</h3><p>${esc(S.management)}</p></div>
+  <div class="card"><h3 style="margin-top:0">Как мотивировать</h3><p>${esc(S.motivate)}</p></div>
+  <div class="card"><h3 style="margin-top:0">Как предотвратить выгорание</h3>${ul(S.burnout)}</div>
+  <div class="card"><h3 style="margin-top:0">Конфликтные триггеры</h3>${ul(S.triggers)}</div>
+  <p class="small muted no-print">Инструкция построена автоматически из результатов тестов. Это вспомогательный инструмент — окончательные решения принимайте по совокупности данных и живого общения.</p>`);
+ window.scrollTo(0,0);
+}
+
+// ---------- ВЫГРУЗКА В WORD (.doc, HTML) ----------
+function _docBlob(title,inner){
+ const html='<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8">'+
+  '<style>body{font-family:Arial,sans-serif;font-size:11pt;color:#111}h1{font-size:18pt;color:#1F3864}h2{font-size:14pt;color:#2E5496;border-bottom:1px solid #ccc}h3{font-size:12pt;color:#333}'+
+  '.tag{color:#1155CC;font-weight:bold}.muted{color:#666}li{margin:3px 0}ol{padding-left:22px}</style></head><body>'+inner+'</body></html>';
+ return new Blob(['﻿'+html],{type:"application/msword"});
+}
+function _download(blob,filename){
+ const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=filename;
+ document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
+}
+function _optLabel(t,v){
+ if(v==null)return "— (нет ответа)";
+ if(t==="logika")return null; // обрабатывается отдельно
+ const o=TESTS[t]&&TESTS[t].opts;return o?o[v]:String(v);
+}
+function _tagFor(t,i){
+ if(t==="paei")return "["+["P","A","E","I"][i%4]+"]";
+ if(t==="arch")return "["+ARCH_TYPES[i%12].name+"]";
+ if(t==="grani")return "["+GRANI_SCALES[i%10].code+"]";
+ if(t==="vovl")return i>=84?"[контроль]":"["+VOVL_SCALES[i%12].name.split(" ")[0]+"]";
+ if(t==="sale")return "["+(i%12+1)+"]";
+ return "";
+}
+function _resultLine(t,r){
+ const res=r.result||{};
+ if(t==="paei")return "Код: "+res.code+". Доминанта: "+PAEI_ROLE_NAME[["P","A","E","I"][res.dominant]]+". P/A/E/I: "+res.sc.join("/")+(res.warn?". ⚠ "+res.warn:"");
+ if(t==="arch")return "Ведущий архетип: "+res.top.map(i=>ARCH_TYPES[i].name).join(", ")+". Мотивация: «"+ARCH_GROUPS[res.motivation].name+"». Группы: "+res.groups.join("/");
+ if(t==="grani"){const st=res.std;return "Сильные: "+(st.map((v,i)=>v>=32?GRANI_SCALES[i].name:null).filter(Boolean).join(", ")||"—")+". Риски: "+(st.map((v,i)=>v<=-32?GRANI_SCALES[i].name:null).filter(Boolean).join(", ")||"—")+". «Не знаю»: "+res.maybeCount+"/200"+(res.unreliable?" (⚠ ненадёжно)":"");}
+ if(t==="logika")return "IQ "+res.iq+" ("+res.band+"). Верно: "+res.correct+"/80. Секции: "+res.sections.join("/");
+ if(t==="vovl")return "Индекс "+res.index+"/10. Искренность "+res.battery+"%.";
+ if(t==="sale")return "Тип: "+(res.type||"—")+".";
+ if(t==="enps")return "Оценка "+res.score+"/10 ("+res.cat+").";
+ if(t==="rez"){const sc=Object.values(r.hr.scores||{});return "Средний балл "+(sc.length?(sc.reduce((a,b)=>a+Number(b),0)/sc.length).toFixed(1):"—")+".";}
+ return "";
+}
+const _METH_SHORT={
+ paei:"40 утверждений, «Да/Иногда/Нет». Роли P-A-E-I по 10 вопросов; Да=2, Иногда=1, Нет=0; ×5 → 0–100.",
+ arch:"72 утверждения, 5-балльная шкала. 12 архетипов по 6 вопросов; группа с макс. средним — тип мотивации.",
+ grani:"200 утверждений, «Да/Не знаю/Нет». 10 шкал по 20 вопросов; итог −100…+100.",
+ logika:"80 задач на время; IQ = 60 + число верных ответов.",
+ vovl:"88 утверждений, 5-балльная шкала. 12 шкал; индекс 0–10; последние 4 — контроль искренности.",
+ sale:"120 утверждений, «Да/Иногда/Нет». 12 качеств продавца; тип «хантер/фермер»."
+};
+function _answersHtml(id){
+ const emp=getEmp(id);const recs=empRecords(id).slice().sort((a,b)=>TEST_ORDER.indexOf(a.test)-TEST_ORDER.indexOf(b.test));
+ let h="<h1>Ответы сотрудника: "+esc(emp.name)+"</h1>";
+ h+="<p class='muted'>Пройдено тестов: "+recs.length+". Документ сформирован из базы системы «Тренерская».</p>";
+ recs.forEach(r=>{
+  const t=r.test;h+="<h2>"+esc(TESTS[t].name)+" — "+esc(TESTS[t].tag)+"</h2>";
+  h+="<p class='muted'>Дата: "+fmtDate(r.date)+"</p>";
+  if(_METH_SHORT[t])h+="<p class='muted'><i>Методика: "+esc(_METH_SHORT[t])+"</i></p>";
+  h+="<p><b>Результат:</b> "+esc(_resultLine(t,r))+"</p><h3>Ответы на вопросы</h3><ol>";
+  (r.answers||[]).forEach((v,i)=>{
+   let line;
+   if(t==="logika"){const q=LOGIKA_Q[i];const chosen=(v==null?"— (нет ответа)":q.o[v]);const ok=v===q.c;
+    line="<span class='tag'>"+(ok?"✓":"✗")+"</span> "+esc(q.q)+" — <b>"+esc(chosen)+"</b>"+(ok?"":" <span class='muted'>(верно: "+esc(q.o[q.c])+")</span>");}
+   else if(t==="rez"){const a=v;const ans=(a&&(a.text||(a.choice!=null?"вариант "+(a.choice+1):"")))||"—";line=esc(getQ(t,i)||("Вопрос "+(i+1)))+" — <b>"+esc(ans)+"</b>";}
+   else{line="<span class='tag'>"+_tagFor(t,i)+"</span> "+esc(getQ(t,i))+" — <b>"+esc(_optLabel(t,v))+"</b>";}
+   h+="<li>"+line+"</li>";
+  });
+  h+="</ol>";
+ });
+ return h;
+}
+function downloadAnswers(id){
+ const emp=getEmp(id);if(!emp)return;
+ if(!empRecords(id).length){alert("У сотрудника пока нет пройденных тестов.");return;}
+ _download(_docBlob("Ответы — "+emp.name,_answersHtml(id)),"Ответы — "+emp.name.replace(/[\\/:*?\"<>|]/g,"")+".doc");
+}
+function _instructionHtml(id){
+ const I=buildInstruction(id);const emp=getEmp(id);
+ if(I.empty)return "<h1>Инструкция по сотруднику: "+esc(emp.name)+"</h1><p>Тесты ещё не пройдены.</p>";
+ const S=I.S;const ul=a=>"<ul>"+a.map(x=>"<li>"+esc(x)+"</li>").join("")+"</ul>";
+ let h="<h1>Инструкция по сотруднику: "+esc(emp.name)+"</h1>";
+ h+="<h2>Часть 1. Коротко о главном</h2>";
+ h+="<h3>1. Архетип и суперсила: "+esc(S.super.name)+"</h3><p>"+esc(S.super.text)+"</p>";
+ h+="<h3>2. Где даст лучший результат</h3><ul>"+S.where.map(w=>"<li><b>"+esc(w.title)+"</b> (совпадение "+w.fit+"%): "+esc(w.tasks)+" <i>"+esc(w.why)+"</i></li>").join("")+"</ul>";
+ h+="<h3>3. Риски</h3>"+ul(S.risks);
+ h+="<h3>4. Совместимость и среда</h3>"+ul(S.compat);
+ h+="<h2>Часть 2. Инструкция по управлению</h2>";
+ h+="<h3>Общий вердикт</h3><p>"+esc(S.verdict)+"</p>";
+ h+="<h3>Чего ждать (сильные стороны)</h3>"+ul(S.strengths);
+ h+="<h3>Главные риски (сценарии)</h3>"+ul(S.scenarios);
+ h+="<h3>Как ставить задачи</h3><p>"+esc(S.setTasks)+"</p>";
+ h+="<h3>Модель управления</h3><p>"+esc(S.management)+"</p>";
+ h+="<h3>Как мотивировать</h3><p>"+esc(S.motivate)+"</p>";
+ h+="<h3>Как предотвратить выгорание</h3>"+ul(S.burnout);
+ h+="<h3>Конфликтные триггеры</h3>"+ul(S.triggers);
+ return h;
+}
+function downloadInstruction(id){
+ const emp=getEmp(id);if(!emp)return;
+ _download(_docBlob("Инструкция — "+emp.name,_instructionHtml(id)),"Инструкция — "+emp.name.replace(/[\\/:*?\"<>|]/g,"")+".doc");
+}
+
+// ---------- настрой на честность перед тестом ----------
+function honestyIntro(){
+ return `<div class="card" style="border-left:4px solid #16a34a;background:#f0fdf4">
+  <h3 style="margin-top:0">Как отвечать, чтобы результат был полезен именно вам</h3>
+  <p style="margin:6px 0">Этот тест — не экзамен, здесь нет «правильных» ответов, и его нельзя «сдать на пятёрку». Его ценность в одном: он покажет ваши реальные сильные стороны и подскажет, на какой работе вам будет легко и в радость. Приукрашенные ответы просто приведут вас не на своё место — проиграете от этого вы.</p>
+  <p style="margin:6px 0"><b>Три простых правила:</b></p>
+  <ul style="margin:6px 0;padding-left:20px">
+   <li>Отвечайте про то, как вы <b>реально поступали</b>, а не как «правильно» или как хотелось бы. Вспомните конкретную ситуацию из прошлого — как вы повели себя тогда.</li>
+   <li>Не выбирайте ответ «получше». Представьте обычный рабочий день и себя в нём — честный ответ обычно первый, что приходит в голову.</li>
+   <li>В тесте встроены проверки искренности: слишком «идеальные» ответы система замечает и помечает профиль как недостоверный. Честность здесь буквально выгоднее.</li>
+  </ul>
+  <p class="small muted" style="margin:6px 0 0">Отвечайте спокойно и по первому побуждению — так портрет получится точным, а рекомендации по вам — рабочими.</p>
+ </div>`;
 }
 
 </script>
