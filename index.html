@@ -4228,17 +4228,36 @@ function renderInstruction(id){
  window.scrollTo(0,0);
 }
 
-// ---------- ВЫГРУЗКА В WORD (.doc, HTML) ----------
-function _docBlob(title,inner){
- const html='<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8">'+
-  '<style>body{font-family:Arial,sans-serif;font-size:11pt;color:#111}h1{font-size:18pt;color:#1F3864}h2{font-size:14pt;color:#2E5496;border-bottom:1px solid #ccc}h3{font-size:12pt;color:#333}'+
-  '.tag{color:#1155CC;font-weight:bold}.muted{color:#666}li{margin:3px 0}ol{padding-left:22px}</style></head><body>'+inner+'</body></html>';
- return new Blob(['﻿'+html],{type:"application/msword"});
+// ---------- ВЫГРУЗКА В WORD (RTF — открывается в Word, Pages, TextEdit) ----------
+// RTF надёжнее, чем HTML-.doc: это настоящий текстовый формат документа, кириллица — через \uN escapes.
+function rtfEsc(s){
+ let o="";const str=String(s==null?"":s);
+ for(const ch of str){let c=ch.codePointAt(0);
+  if(ch==="\\")o+="\\\\";else if(ch==="{")o+="\\{";else if(ch==="}")o+="\\}";
+  else if(ch==="\n")o+="\\line ";
+  else if(c<128)o+=ch;
+  else if(c>65535)o+="?";
+  else{if(c>32767)c-=65536;o+="\\u"+c+"?";}
+ }
+ return o;
+}
+function _run(text,bold){return (bold?"{\\b ":"{")+rtfEsc(text)+"}";}
+function _par(inline,o){o=o||{};return "\\pard"+(o.sb?"\\sb"+o.sb:"")+"\\sa"+(o.sa!=null?o.sa:40)+(o.li?"\\li"+o.li:"")+(o.fi?"\\fi"+o.fi:"")+"\\fs"+(o.sz||20)+" "+inline+"\\par\n";}
+const _rH1=t=>_par(_run(t,true),{sz:32,sb:220,sa:120});
+const _rH2=t=>_par(_run(t,true),{sz:26,sb:180,sa:80});
+const _rH3=t=>_par(_run(t,true),{sz:22,sb:140,sa:60});
+const _rP=t=>_par(_run(t,false),{sz:20,sa:80});
+const _rBul=inline=>_par("\\bullet  "+inline,{sz:20,sa:20,li:360,fi:-200});
+function _rtfDoc(body){
+ const head="{\\rtf1\\ansi\\ansicpg1251\\deff0{\\fonttbl{\\f0\\fswiss\\fcharset204 Arial;}}\\viewkind4\\fs20\n";
+ return head+body+"}";
 }
 function _download(blob,filename){
  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=filename;
  document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
 }
+function _saveRtf(body,filename){_download(new Blob([_rtfDoc(body)],{type:"application/rtf"}),filename);}
+function _fnameSafe(n){return n.replace(/[\\/:*?"<>|]/g,"").trim();}
 function _optLabel(t,v){
  if(v==null)return "— (нет ответа)";
  if(t==="logika")return null; // обрабатывается отдельно
@@ -4272,56 +4291,62 @@ const _METH_SHORT={
  vovl:"88 утверждений, 5-балльная шкала. 12 шкал; индекс 0–10; последние 4 — контроль искренности.",
  sale:"120 утверждений, «Да/Иногда/Нет». 12 качеств продавца; тип «хантер/фермер»."
 };
-function _answersHtml(id){
+function _answersRtf(id){
  const emp=getEmp(id);const recs=empRecords(id).slice().sort((a,b)=>TEST_ORDER.indexOf(a.test)-TEST_ORDER.indexOf(b.test));
- let h="<h1>Ответы сотрудника: "+esc(emp.name)+"</h1>";
- h+="<p class='muted'>Пройдено тестов: "+recs.length+". Документ сформирован из базы системы «Тренерская».</p>";
+ let b=_rH1("Ответы сотрудника: "+emp.name);
+ b+=_rP("Пройдено тестов: "+recs.length+". Документ сформирован из базы системы «Тренерская».");
  recs.forEach(r=>{
-  const t=r.test;h+="<h2>"+esc(TESTS[t].name)+" — "+esc(TESTS[t].tag)+"</h2>";
-  h+="<p class='muted'>Дата: "+fmtDate(r.date)+"</p>";
-  if(_METH_SHORT[t])h+="<p class='muted'><i>Методика: "+esc(_METH_SHORT[t])+"</i></p>";
-  h+="<p><b>Результат:</b> "+esc(_resultLine(t,r))+"</p><h3>Ответы на вопросы</h3><ol>";
+  const t=r.test;
+  b+=_rH2(TESTS[t].name+" — "+TESTS[t].tag);
+  b+=_rP("Дата: "+fmtDate(r.date));
+  if(_METH_SHORT[t])b+=_rP("Методика: "+_METH_SHORT[t]);
+  b+=_par(_run("Результат: ",true)+_run(_resultLine(t,r),false),{sz:20,sa:100});
+  b+=_rH3("Ответы на вопросы");
   (r.answers||[]).forEach((v,i)=>{
-   let line;
+   let inline;const num=(i+1)+". ";
    if(t==="logika"){const q=LOGIKA_Q[i];const chosen=(v==null?"— (нет ответа)":q.o[v]);const ok=v===q.c;
-    line="<span class='tag'>"+(ok?"✓":"✗")+"</span> "+esc(q.q)+" — <b>"+esc(chosen)+"</b>"+(ok?"":" <span class='muted'>(верно: "+esc(q.o[q.c])+")</span>");}
-   else if(t==="rez"){const a=v;const ans=(a&&(a.text||(a.choice!=null?"вариант "+(a.choice+1):"")))||"—";line=esc(getQ(t,i)||("Вопрос "+(i+1)))+" — <b>"+esc(ans)+"</b>";}
-   else{line="<span class='tag'>"+_tagFor(t,i)+"</span> "+esc(getQ(t,i))+" — <b>"+esc(_optLabel(t,v))+"</b>";}
-   h+="<li>"+line+"</li>";
+    inline=_run(num+(ok?"[верно] ":"[неверно] "),true)+_run(q.q+" — ",false)+_run(chosen,true)+(ok?"":_run(" (верно: "+q.o[q.c]+")",false));}
+   else if(t==="rez"){const a=v||{};const q=REZ_Q[i];let ans;
+    if(q.type==="multi")ans=(a.multi&&a.multi.length?a.multi.map(x=>q.options[x]).join("; "):"—");
+    else if(q.type==="choicetext"||q.type==="choice"){ans=(a.choice!=null?q.options[a.choice]:"—")+(a.text&&a.text.trim()?" / "+a.text.trim():"");}
+    else ans=(a.text&&a.text.trim())?a.text.trim():"—";
+    inline=_run(num,true)+_run(q.text+" — ",false)+_run(ans,true);}
+   else{inline=_run(num+_tagFor(t,i)+" ",true)+_run(getQ(t,i)+" — ",false)+_run(_optLabel(t,v),true);}
+   b+=_par(inline,{sz:20,sa:20});
   });
-  h+="</ol>";
  });
- return h;
+ return b;
 }
 function downloadAnswers(id){
  const emp=getEmp(id);if(!emp)return;
  if(!empRecords(id).length){alert("У сотрудника пока нет пройденных тестов.");return;}
- _download(_docBlob("Ответы — "+emp.name,_answersHtml(id)),"Ответы — "+emp.name.replace(/[\\/:*?\"<>|]/g,"")+".doc");
+ _saveRtf(_answersRtf(id),"Ответы — "+_fnameSafe(emp.name)+".rtf");
 }
-function _instructionHtml(id){
+function _instructionRtf(id){
  const I=buildInstruction(id);const emp=getEmp(id);
- if(I.empty)return "<h1>Инструкция по сотруднику: "+esc(emp.name)+"</h1><p>Тесты ещё не пройдены.</p>";
- const S=I.S;const ul=a=>"<ul>"+a.map(x=>"<li>"+esc(x)+"</li>").join("")+"</ul>";
- let h="<h1>Инструкция по сотруднику: "+esc(emp.name)+"</h1>";
- h+="<h2>Часть 1. Коротко о главном</h2>";
- h+="<h3>1. Архетип и суперсила: "+esc(S.super.name)+"</h3><p>"+esc(S.super.text)+"</p>";
- h+="<h3>2. Где даст лучший результат</h3><ul>"+S.where.map(w=>"<li><b>"+esc(w.title)+"</b> (совпадение "+w.fit+"%): "+esc(w.tasks)+" <i>"+esc(w.why)+"</i></li>").join("")+"</ul>";
- h+="<h3>3. Риски</h3>"+ul(S.risks);
- h+="<h3>4. Совместимость и среда</h3>"+ul(S.compat);
- h+="<h2>Часть 2. Инструкция по управлению</h2>";
- h+="<h3>Общий вердикт</h3><p>"+esc(S.verdict)+"</p>";
- h+="<h3>Чего ждать (сильные стороны)</h3>"+ul(S.strengths);
- h+="<h3>Главные риски (сценарии)</h3>"+ul(S.scenarios);
- h+="<h3>Как ставить задачи</h3><p>"+esc(S.setTasks)+"</p>";
- h+="<h3>Модель управления</h3><p>"+esc(S.management)+"</p>";
- h+="<h3>Как мотивировать</h3><p>"+esc(S.motivate)+"</p>";
- h+="<h3>Как предотвратить выгорание</h3>"+ul(S.burnout);
- h+="<h3>Конфликтные триггеры</h3>"+ul(S.triggers);
- return h;
+ if(I.empty)return _rH1("Инструкция по сотруднику: "+emp.name)+_rP("Тесты ещё не пройдены.");
+ const S=I.S;const ul=a=>a.map(x=>_rBul(_run(x,false))).join("");
+ let b=_rH1("Инструкция по сотруднику: "+emp.name);
+ b+=_rH2("Часть 1. Коротко о главном");
+ b+=_rH3("1. Архетип и суперсила: "+S.super.name)+_rP(S.super.text);
+ b+=_rH3("2. Где даст лучший результат");
+ b+=S.where.map(w=>_rBul(_run(w.title+" (совпадение "+w.fit+"%): ",true)+_run(w.tasks+" "+w.why,false))).join("");
+ b+=_rH3("3. Риски")+ul(S.risks);
+ b+=_rH3("4. Совместимость и среда")+ul(S.compat);
+ b+=_rH2("Часть 2. Инструкция по управлению");
+ b+=_rH3("Общий вердикт")+_rP(S.verdict);
+ b+=_rH3("Чего ждать (сильные стороны)")+ul(S.strengths);
+ b+=_rH3("Главные риски (сценарии)")+ul(S.scenarios);
+ b+=_rH3("Как ставить задачи")+_rP(S.setTasks);
+ b+=_rH3("Модель управления")+_rP(S.management);
+ b+=_rH3("Как мотивировать")+_rP(S.motivate);
+ b+=_rH3("Как предотвратить выгорание")+ul(S.burnout);
+ b+=_rH3("Конфликтные триггеры")+ul(S.triggers);
+ return b;
 }
 function downloadInstruction(id){
  const emp=getEmp(id);if(!emp)return;
- _download(_docBlob("Инструкция — "+emp.name,_instructionHtml(id)),"Инструкция — "+emp.name.replace(/[\\/:*?\"<>|]/g,"")+".doc");
+ _saveRtf(_instructionRtf(id),"Инструкция — "+_fnameSafe(emp.name)+".rtf");
 }
 
 // ---------- настрой на честность перед тестом ----------
